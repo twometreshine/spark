@@ -17,14 +17,15 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TypeCheckResult}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.types._
 
 abstract class UnevaluableBooleanAggBase(arg: Expression)
-  extends UnevaluableAggregate with ImplicitCastInputTypes {
+  extends UnevaluableAggregate with ImplicitCastInputTypes with UnaryLike[Expression] {
 
-  override def children: Seq[Expression] = arg :: Nil
+  override def child: Expression = arg
 
   override def dataType: DataType = BooleanType
 
@@ -51,9 +52,12 @@ abstract class UnevaluableBooleanAggBase(arg: Expression)
       > SELECT _FUNC_(col) FROM VALUES (true), (false), (true) AS tab(col);
        false
   """,
+  group = "agg_funcs",
   since = "3.0.0")
-case class EveryAgg(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
-  override def nodeName: String = "Every"
+case class BoolAnd(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
+  override def nodeName: String = getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("bool_and")
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(arg = newChild)
 }
 
 @ExpressionDescription(
@@ -67,23 +71,10 @@ case class EveryAgg(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
       > SELECT _FUNC_(col) FROM VALUES (false), (false), (NULL) AS tab(col);
        false
   """,
+  group = "agg_funcs",
   since = "3.0.0")
-case class AnyAgg(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
-  override def nodeName: String = "Any"
-}
-
-@ExpressionDescription(
-  usage = "_FUNC_(expr) - Returns true if at least one value of `expr` is true.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_(col) FROM VALUES (true), (false), (false) AS tab(col);
-       true
-      > SELECT _FUNC_(col) FROM VALUES (NULL), (true), (false) AS tab(col);
-       true
-      > SELECT _FUNC_(col) FROM VALUES (false), (false), (NULL) AS tab(col);
-       false
-  """,
-  since = "3.0.0")
-case class SomeAgg(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
-  override def nodeName: String = "Some"
+case class BoolOr(arg: Expression) extends UnevaluableBooleanAggBase(arg) {
+  override def nodeName: String = getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("bool_or")
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(arg = newChild)
 }

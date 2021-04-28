@@ -22,10 +22,11 @@ import java.nio.file.{Files, Paths}
 import scala.collection.JavaConverters._
 import scala.util.Try
 
+import org.scalatest.Assertions._
+
 import org.apache.spark.TestUtils
 import org.apache.spark.api.python.{PythonBroadcast, PythonEvalType, PythonFunction, PythonUtils}
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.internal.config.Tests
 import org.apache.spark.sql.catalyst.expressions.{Cast, Expression}
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.execution.python.UserDefinedPythonFunction
@@ -73,14 +74,7 @@ object IntegratedUDFTestUtils extends SQLHelper {
   import scala.sys.process._
 
   private lazy val pythonPath = sys.env.getOrElse("PYTHONPATH", "")
-  private lazy val sparkHome = if (sys.props.contains(Tests.IS_TESTING.key)) {
-    assert(sys.props.contains("spark.test.home") ||
-      sys.env.contains("SPARK_HOME"), "spark.test.home or SPARK_HOME is not set.")
-    sys.props.getOrElse("spark.test.home", sys.env("SPARK_HOME"))
-  } else {
-    assert(sys.env.contains("SPARK_HOME"), "SPARK_HOME is not set.")
-    sys.env("SPARK_HOME")
-  }
+
   // Note that we will directly refer pyspark's source, not the zip from a regular build.
   // It is possible the test is being ran without the build.
   private lazy val sourcePath = Paths.get(sparkHome, "python").toAbsolutePath
@@ -103,7 +97,7 @@ object IntegratedUDFTestUtils extends SQLHelper {
       Seq(
         pythonExec,
         "-c",
-        "from pyspark.sql.utils import require_minimum_pandas_version;" +
+        "from pyspark.sql.pandas.utils import require_minimum_pandas_version;" +
           "require_minimum_pandas_version()"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
@@ -115,20 +109,38 @@ object IntegratedUDFTestUtils extends SQLHelper {
       Seq(
         pythonExec,
         "-c",
-        "from pyspark.sql.utils import require_minimum_pyarrow_version;" +
+        "from pyspark.sql.pandas.utils import require_minimum_pyarrow_version;" +
           "require_minimum_pyarrow_version()"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
     true
   }.getOrElse(false)
 
-  private lazy val pythonVer = if (isPythonAvailable) {
+  lazy val pythonVer: String = if (isPythonAvailable) {
     Process(
       Seq(pythonExec, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
   } else {
     throw new RuntimeException(s"Python executable [$pythonExec] is unavailable.")
+  }
+
+  lazy val pandasVer: String = if (isPandasAvailable) {
+    Process(
+      Seq(pythonExec, "-c", "import pandas; print(pandas.__version__)"),
+      None,
+      "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
+  } else {
+    throw new RuntimeException("Pandas is unavailable.")
+  }
+
+  lazy val pyarrowVer: String = if (isPyArrowAvailable) {
+    Process(
+      Seq(pythonExec, "-c", "import pyarrow; print(pyarrow.__version__)"),
+      None,
+      "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
+  } else {
+    throw new RuntimeException("PyArrow is unavailable.")
   }
 
   // Dynamically pickles and reads the Python instance into JVM side in order to mimic
@@ -184,7 +196,7 @@ object IntegratedUDFTestUtils extends SQLHelper {
 
   lazy val pythonExec: String = {
     val pythonExec = sys.env.getOrElse(
-      "PYSPARK_DRIVER_PYTHON", sys.env.getOrElse("PYSPARK_PYTHON", "python3.6"))
+      "PYSPARK_DRIVER_PYTHON", sys.env.getOrElse("PYSPARK_PYTHON", "python3"))
     if (TestUtils.testCommandAvailable(pythonExec)) {
       pythonExec
     } else {
@@ -309,25 +321,33 @@ object IntegratedUDFTestUtils extends SQLHelper {
    *   casted_col.cast(df.schema("col").dataType)
    * }}}
    */
-  case class TestScalaUDF(name: String) extends TestUDF {
-    private[IntegratedUDFTestUtils] lazy val udf = new SparkUserDefinedFunction(
-      (input: Any) => if (input == null) {
-        null
-      } else {
-        input.toString
-      },
-      StringType,
-      inputSchemas = Seq.fill(1)(None),
-      name = Some(name)) {
+  class TestInternalScalaUDF(name: String) extends SparkUserDefinedFunction(
+    (input: Any) => if (input == null) {
+      null
+    } else {
+      input.toString
+    },
+    StringType,
+    inputEncoders = Seq.fill(1)(None),
+    name = Some(name)) {
 
-      override def apply(exprs: Column*): Column = {
-        assert(exprs.length == 1, "Defined UDF only has one column")
-        val expr = exprs.head.expr
-        assert(expr.resolved, "column should be resolved to use the same type " +
-          "as input. Try df(name) or df.col(name)")
-        Column(Cast(createScalaUDF(Cast(expr, StringType) :: Nil), expr.dataType))
-      }
+    override def apply(exprs: Column*): Column = {
+      assert(exprs.length == 1, "Defined UDF only has one column")
+      val expr = exprs.head.expr
+      assert(expr.resolved, "column should be resolved to use the same type " +
+        "as input. Try df(name) or df.col(name)")
+      Column(Cast(createScalaUDF(Cast(expr, StringType) :: Nil), expr.dataType))
     }
+
+    override def withName(name: String): TestInternalScalaUDF = {
+      // "withName" should overridden to return TestInternalScalaUDF. Otherwise, the current object
+      // is sliced and the overridden "apply" is not invoked.
+      new TestInternalScalaUDF(name)
+    }
+  }
+
+  case class TestScalaUDF(name: String) extends TestUDF {
+    private[IntegratedUDFTestUtils] lazy val udf = new TestInternalScalaUDF(name)
 
     def apply(exprs: Column*): Column = udf(exprs: _*)
 

@@ -18,13 +18,14 @@
 package org.apache.spark.sql.catalyst
 
 import java.io._
-import java.nio.charset.StandardCharsets
+import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.atomic.AtomicBoolean
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{NumericType, StringType}
+import org.apache.spark.sql.types.{MetadataBuilder, NumericType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
@@ -45,7 +46,7 @@ package object util extends Logging {
     }
   }
 
-  def fileToString(file: File, encoding: String = "UTF-8"): String = {
+  def fileToString(file: File, encoding: Charset = UTF_8): String = {
     val inStream = new FileInputStream(file)
     val outStream = new ByteArrayOutputStream
     try {
@@ -87,7 +88,7 @@ package object util extends Logging {
 
   def resourceToString(
       resource: String,
-      encoding: String = "UTF-8",
+      encoding: String = UTF_8.name(),
       classLoader: ClassLoader = Utils.getSparkClassLoader): String = {
     new String(resourceToBytes(resource, classLoader), encoding)
   }
@@ -119,7 +120,7 @@ package object util extends Logging {
       t.printStackTrace(writer)
       writer.flush()
     }
-    new String(out.toByteArray, StandardCharsets.UTF_8)
+    new String(out.toByteArray, UTF_8)
   }
 
   // Replaces attributes, string literals, complex type extractors with their pretty form so that
@@ -128,17 +129,30 @@ package object util extends Logging {
     case a: Attribute => new PrettyAttribute(a)
     case Literal(s: UTF8String, StringType) => PrettyAttribute(s.toString, StringType)
     case Literal(v, t: NumericType) if v != null => PrettyAttribute(v.toString, t)
+    case Literal(null, dataType) => PrettyAttribute("NULL", dataType)
     case e: GetStructField =>
       val name = e.name.getOrElse(e.childSchema(e.ordinal).name)
       PrettyAttribute(usePrettyExpression(e.child).sql + "." + name, e.dataType)
     case e: GetArrayStructFields =>
       PrettyAttribute(usePrettyExpression(e.child) + "." + e.field.name, e.dataType)
+    case r: RuntimeReplaceable =>
+      PrettyAttribute(r.mkString(r.exprsReplaced.map(toPrettySQL)), r.dataType)
+    case c: CastBase if !c.getTagValue(Cast.USER_SPECIFIED_CAST).getOrElse(false) =>
+      PrettyAttribute(usePrettyExpression(c.child).sql, c.dataType)
   }
 
   def quoteIdentifier(name: String): String = {
     // Escapes back-ticks within the identifier name with double-back-ticks, and then quote the
     // identifier with back-ticks.
     "`" + name.replace("`", "``") + "`"
+  }
+
+  def quoteIfNeeded(part: String): String = {
+    if (part.matches("[a-zA-Z0-9_]+") && !part.matches("\\d+")) {
+      part
+    } else {
+      s"`${part.replace("`", "``")}`"
+    }
   }
 
   def toPrettySQL(e: Expression): String = usePrettyExpression(e).sql
@@ -186,5 +200,29 @@ package object util extends Logging {
   /** Shorthand for calling truncatedString() without start or end strings. */
   def truncatedString[T](seq: Seq[T], sep: String, maxFields: Int): String = {
     truncatedString(seq, "", sep, "", maxFields)
+  }
+
+  val METADATA_COL_ATTR_KEY = "__metadata_col"
+
+  implicit class MetadataColumnHelper(attr: Attribute) {
+    /**
+     * If set, this metadata column is a candidate during qualified star expansions.
+     */
+    val SUPPORTS_QUALIFIED_STAR = "__supports_qualified_star"
+
+    def isMetadataCol: Boolean = attr.metadata.contains(METADATA_COL_ATTR_KEY) &&
+      attr.metadata.getBoolean(METADATA_COL_ATTR_KEY)
+
+    def supportsQualifiedStar: Boolean = attr.isMetadataCol &&
+      attr.metadata.contains(SUPPORTS_QUALIFIED_STAR) &&
+      attr.metadata.getBoolean(SUPPORTS_QUALIFIED_STAR)
+
+    def markAsSupportsQualifiedStar(): Attribute = attr.withMetadata(
+      new MetadataBuilder()
+        .withMetadata(attr.metadata)
+        .putBoolean(METADATA_COL_ATTR_KEY, true)
+        .putBoolean(SUPPORTS_QUALIFIED_STAR, true)
+        .build()
+    )
   }
 }

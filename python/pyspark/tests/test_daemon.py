@@ -47,6 +47,9 @@ class DaemonTests(unittest.TestCase):
         # daemon should accept connections
         self.assertTrue(self.connect(port))
 
+        # wait worker process spawned from daemon exit.
+        time.sleep(1)
+
         # request shutdown
         terminator(daemon)
         time.sleep(1)
@@ -70,10 +73,10 @@ class DaemonTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_daemon import *
+    from pyspark.tests.test_daemon import *  # noqa: F401
 
     try:
-        import xmlrunner
+        import xmlrunner  # type: ignore[import]
         testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None

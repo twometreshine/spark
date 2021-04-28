@@ -16,26 +16,27 @@
  */
 package org.apache.spark.sql.catalyst.expressions
 
-import java.time.ZoneId
+import java.time.{Duration, Period, ZoneId}
 import java.util.Comparator
 
 import scala.collection.mutable
 import scala.reflect.ClassTag
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion}
+import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion, UnresolvedSeed}
 import org.apache.spark.sql.catalyst.expressions.ArraySortLike.NullOrder
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.trees.TreePattern.{CONCAT, TreePattern}
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.UTF8StringBuilder
 import org.apache.spark.unsafe.array.ByteArrayMethods
 import org.apache.spark.unsafe.array.ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH
-import org.apache.spark.unsafe.types.{ByteArray, UTF8String}
-import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.unsafe.types.{ByteArray, CalendarInterval, UTF8String}
 import org.apache.spark.util.collection.OpenHashSet
 
 /**
@@ -77,9 +78,9 @@ trait BinaryArrayExpressionWithImplicitCast extends BinaryExpression
 @ExpressionDescription(
   usage = """
     _FUNC_(expr) - Returns the size of an array or a map.
-    The function returns -1 if its input is null and spark.sql.legacy.sizeOfNull is set to true.
-    If spark.sql.legacy.sizeOfNull is set to false, the function returns null for null input.
-    By default, the spark.sql.legacy.sizeOfNull parameter is set to true.
+    The function returns null for null input if spark.sql.legacy.sizeOfNull is set to false or
+    spark.sql.ansi.enabled is set to true. Otherwise, the function returns -1 for null input.
+    With the default settings, the function returns -1 for null input.
   """,
   examples = """
     Examples:
@@ -89,10 +90,13 @@ trait BinaryArrayExpressionWithImplicitCast extends BinaryExpression
        2
       > SELECT _FUNC_(NULL);
        -1
-  """)
-case class Size(child: Expression) extends UnaryExpression with ExpectsInputTypes {
+  """,
+  since = "1.5.0",
+  group = "collection_funcs")
+case class Size(child: Expression, legacySizeOfNull: Boolean)
+  extends UnaryExpression with ExpectsInputTypes {
 
-  val legacySizeOfNull = SQLConf.get.legacySizeOfNull
+  def this(child: Expression) = this(child, SQLConf.get.legacySizeOfNull)
 
   override def dataType: DataType = IntegerType
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(ArrayType, MapType))
@@ -122,6 +126,12 @@ case class Size(child: Expression) extends UnaryExpression with ExpectsInputType
       defineCodeGen(ctx, ev, c => s"($c).numElements()")
     }
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Size = copy(child = newChild)
+}
+
+object Size {
+  def apply(child: Expression): Size = new Size(child)
 }
 
 /**
@@ -133,9 +143,11 @@ case class Size(child: Expression) extends UnaryExpression with ExpectsInputType
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
        [1,2]
-  """)
+  """,
+  group = "map_funcs",
+  since = "2.0.0")
 case class MapKeys(child: Expression)
-  extends UnaryExpression with ExpectsInputTypes {
+  extends UnaryExpression with ExpectsInputTypes with NullIntolerant {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(MapType)
 
@@ -150,6 +162,9 @@ case class MapKeys(child: Expression)
   }
 
   override def prettyName: String = "map_keys"
+
+  override protected def withNewChildInternal(newChild: Expression): MapKeys =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
@@ -164,6 +179,7 @@ case class MapKeys(child: Expression)
       > SELECT _FUNC_(array(1, 2), array(2, 3), array(3, 4));
        [{"0":1,"1":2,"2":3},{"0":2,"1":3,"2":4}]
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArraysZip(children: Seq[Expression]) extends Expression with ExpectsInputTypes {
 
@@ -311,6 +327,9 @@ case class ArraysZip(children: Seq[Expression]) extends Expression with ExpectsI
   }
 
   override def prettyName: String = "arrays_zip"
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): ArraysZip =
+    copy(children = newChildren)
 }
 
 /**
@@ -322,9 +341,11 @@ case class ArraysZip(children: Seq[Expression]) extends Expression with ExpectsI
     Examples:
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
        ["a","b"]
-  """)
+  """,
+  group = "map_funcs",
+  since = "2.0.0")
 case class MapValues(child: Expression)
-  extends UnaryExpression with ExpectsInputTypes {
+  extends UnaryExpression with ExpectsInputTypes with NullIntolerant {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(MapType)
 
@@ -339,6 +360,9 @@ case class MapValues(child: Expression)
   }
 
   override def prettyName: String = "map_values"
+
+  override protected def withNewChildInternal(newChild: Expression): MapValues =
+    copy(child = newChild)
 }
 
 /**
@@ -351,14 +375,16 @@ case class MapValues(child: Expression)
       > SELECT _FUNC_(map(1, 'a', 2, 'b'));
        [{"key":1,"value":"a"},{"key":2,"value":"b"}]
   """,
+  group = "map_funcs",
   since = "3.0.0")
-case class MapEntries(child: Expression) extends UnaryExpression with ExpectsInputTypes {
+case class MapEntries(child: Expression)
+  extends UnaryExpression with ExpectsInputTypes with NullIntolerant {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(MapType)
 
   @transient private lazy val childDataType: MapType = child.dataType.asInstanceOf[MapType]
 
-  override def dataType: DataType = {
+  private lazy val internalDataType: DataType = {
     ArrayType(
       StructType(
         StructField("key", childDataType.keyType, false) ::
@@ -366,6 +392,8 @@ case class MapEntries(child: Expression) extends UnaryExpression with ExpectsInp
         Nil),
       false)
   }
+
+  override def dataType: DataType = internalDataType
 
   override protected def nullSafeEval(input: Any): Any = {
     val childMap = input.asInstanceOf[MapData]
@@ -507,6 +535,8 @@ case class MapEntries(child: Expression) extends UnaryExpression with ExpectsInp
   }
 
   override def prettyName: String = "map_entries"
+
+  override def withNewChildInternal(newChild: Expression): MapEntries = copy(child = newChild)
 }
 
 /**
@@ -516,9 +546,11 @@ case class MapEntries(child: Expression) extends UnaryExpression with ExpectsInp
   usage = "_FUNC_(map, ...) - Returns the union of all the given maps",
   examples = """
     Examples:
-      > SELECT _FUNC_(map(1, 'a', 2, 'b'), map(2, 'c', 3, 'd'));
-       {1:"a",2:"c",3:"d"}
-  """, since = "2.4.0")
+      > SELECT _FUNC_(map(1, 'a', 2, 'b'), map(3, 'c'));
+       {1:"a",2:"b",3:"c"}
+  """,
+  group = "map_funcs",
+  since = "2.4.0")
 case class MapConcat(children: Seq[Expression]) extends ComplexTypeMergingExpression {
 
   override def checkInputDataTypes(): TypeCheckResult = {
@@ -624,6 +656,9 @@ case class MapConcat(children: Seq[Expression]) extends ComplexTypeMergingExpres
   }
 
   override def prettyName: String = "map_concat"
+
+  override def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): MapConcat =
+    copy(children = newChildren)
 }
 
 /**
@@ -636,8 +671,9 @@ case class MapConcat(children: Seq[Expression]) extends ComplexTypeMergingExpres
       > SELECT _FUNC_(array(struct(1, 'a'), struct(2, 'b')));
        {1:"a",2:"b"}
   """,
+  group = "map_funcs",
   since = "2.4.0")
-case class MapFromEntries(child: Expression) extends UnaryExpression {
+case class MapFromEntries(child: Expression) extends UnaryExpression with NullIntolerant {
 
   @transient
   private lazy val dataTypeDetails: Option[(MapType, Boolean, Boolean)] = child.dataType match {
@@ -701,6 +737,9 @@ case class MapFromEntries(child: Expression) extends UnaryExpression {
   }
 
   override def prettyName: String = "map_from_entries"
+
+  override protected def withNewChildInternal(newChild: Expression): MapFromEntries =
+    copy(child = newChild)
 }
 
 
@@ -857,10 +896,12 @@ object ArraySortLike {
     Examples:
       > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'), true);
        [null,"a","b","c","d"]
-  """)
+  """,
+  group = "array_funcs",
+  since = "1.5.0")
 // scalastyle:on line.size.limit
 case class SortArray(base: Expression, ascendingOrder: Expression)
-  extends BinaryExpression with ArraySortLike {
+  extends BinaryExpression with ArraySortLike with NullIntolerant {
 
   def this(e: Expression) = this(e, Literal(true))
 
@@ -898,54 +939,10 @@ case class SortArray(base: Expression, ascendingOrder: Expression)
   }
 
   override def prettyName: String = "sort_array"
-}
 
-
-/**
- * Sorts the input array in ascending order according to the natural ordering of
- * the array elements and returns it.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = """
-    _FUNC_(array) - Sorts the input array in ascending order. The elements of the input array must
-      be orderable. Null elements will be placed at the end of the returned array.
-  """,
-  examples = """
-    Examples:
-      > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'));
-       ["a","b","c","d",null]
-  """,
-  since = "2.4.0")
-// scalastyle:on line.size.limit
-case class ArraySort(child: Expression) extends UnaryExpression with ArraySortLike {
-
-  override def dataType: DataType = child.dataType
-  override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType)
-
-  override def arrayExpression: Expression = child
-  override def nullOrder: NullOrder = NullOrder.Greatest
-
-  override def checkInputDataTypes(): TypeCheckResult = child.dataType match {
-    case ArrayType(dt, _) if RowOrdering.isOrderable(dt) =>
-      TypeCheckResult.TypeCheckSuccess
-    case ArrayType(dt, _) =>
-      val dtSimple = dt.catalogString
-      TypeCheckResult.TypeCheckFailure(
-        s"$prettyName does not support sorting array of type $dtSimple which is not orderable")
-    case _ =>
-      TypeCheckResult.TypeCheckFailure(s"$prettyName only supports array input.")
-  }
-
-  override def nullSafeEval(array: Any): Any = {
-    sortEval(array, true)
-  }
-
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, c => sortCodegen(ctx, ev, c, "true"))
-  }
-
-  override def prettyName: String = "array_sort"
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): SortArray =
+    copy(base = newLeft, ascendingOrder = newRight)
 }
 
 /**
@@ -963,11 +960,14 @@ case class ArraySort(child: Expression) extends UnaryExpression with ArraySortLi
   note = """
     The function is non-deterministic.
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class Shuffle(child: Expression, randomSeed: Option[Long] = None)
   extends UnaryExpression with ExpectsInputTypes with Stateful with ExpressionWithRandomSeed {
 
   def this(child: Expression) = this(child, None)
+
+  override def seedExpression: Expression = randomSeed.map(Literal.apply).getOrElse(UnresolvedSeed)
 
   override def withNewSeed(seed: Long): Shuffle = copy(randomSeed = Some(seed))
 
@@ -1031,6 +1031,8 @@ case class Shuffle(child: Expression, randomSeed: Option[Long] = None)
   }
 
   override def freshCopy(): Shuffle = Shuffle(child, randomSeed)
+
+  override def withNewChildInternal(newChild: Expression): Shuffle = copy(child = newChild)
 }
 
 /**
@@ -1045,12 +1047,14 @@ case class Shuffle(child: Expression, randomSeed: Option[Long] = None)
       > SELECT _FUNC_(array(2, 1, 4, 3));
        [3,4,1,2]
   """,
+  group = "collection_funcs",
   since = "1.5.0",
   note = """
     Reverse logic for arrays is available since 2.4.0.
   """
 )
-case class Reverse(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+case class Reverse(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   // Input types are utilized by type coercion in ImplicitTypeCasts.
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(StringType, ArrayType))
@@ -1105,6 +1109,9 @@ case class Reverse(child: Expression) extends UnaryExpression with ImplicitCastI
   }
 
   override def prettyName: String = "reverse"
+
+  override protected def withNewChildInternal(newChild: Expression): Reverse =
+    copy(child = newChild)
 }
 
 /**
@@ -1116,9 +1123,11 @@ case class Reverse(child: Expression) extends UnaryExpression with ImplicitCastI
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), 2);
        true
-  """)
+  """,
+  group = "array_funcs",
+  since = "1.5.0")
 case class ArrayContains(left: Expression, right: Expression)
-  extends BinaryExpression with ImplicitCastInputTypes {
+  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = BooleanType
 
@@ -1129,7 +1138,7 @@ case class ArrayContains(left: Expression, right: Expression)
     (left.dataType, right.dataType) match {
       case (_, NullType) => Seq.empty
       case (ArrayType(e1, hasNull), e2) =>
-        TypeCoercion.findTightestCommonType(e1, e2) match {
+        TypeCoercion.findWiderTypeWithoutStringPromotionForTwo(e1, e2) match {
           case Some(dt) => Seq(ArrayType(dt, hasNull), dt)
           case _ => Seq.empty
         }
@@ -1200,6 +1209,10 @@ case class ArrayContains(left: Expression, right: Expression)
   }
 
   override def prettyName: String = "array_contains"
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): ArrayContains =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -1212,10 +1225,12 @@ case class ArrayContains(left: Expression, right: Expression)
     Examples:
       > SELECT _FUNC_(array(1, 2, 3), array(3, 4, 5));
        true
-  """, since = "2.4.0")
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
 // scalastyle:off line.size.limit
 case class ArraysOverlap(left: Expression, right: Expression)
-  extends BinaryArrayExpressionWithImplicitCast {
+  extends BinaryArrayExpressionWithImplicitCast with NullIntolerant {
 
   override def checkInputDataTypes(): TypeCheckResult = super.checkInputDataTypes() match {
     case TypeCheckResult.TypeCheckSuccess =>
@@ -1421,6 +1436,10 @@ case class ArraysOverlap(left: Expression, right: Expression)
   }
 
   override def prettyName: String = "arrays_overlap"
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): ArraysOverlap =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -1428,23 +1447,27 @@ case class ArraysOverlap(left: Expression, right: Expression)
  */
 // scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(x, start, length) - Subsets array x starting from index start (or starting from the end if start is negative) with the specified length.",
+  usage = "_FUNC_(x, start, length) - Subsets array x starting from index start (array indices start at 1, or starting from the end if start is negative) with the specified length.",
   examples = """
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, 4), 2, 2);
        [2,3]
       > SELECT _FUNC_(array(1, 2, 3, 4), -2, 2);
        [3,4]
-  """, since = "2.4.0")
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
 // scalastyle:on line.size.limit
 case class Slice(x: Expression, start: Expression, length: Expression)
-  extends TernaryExpression with ImplicitCastInputTypes {
+  extends TernaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = x.dataType
 
   override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType, IntegerType, IntegerType)
 
-  @transient override lazy val children: Seq[Expression] = Seq(x, start, length) // called from eval
+  override def first: Expression = x
+  override def second: Expression = start
+  override def third: Expression = length
 
   @transient private lazy val elementType: DataType = x.dataType.asInstanceOf[ArrayType].elementType
 
@@ -1530,6 +1553,10 @@ case class Slice(x: Expression, start: Expression, length: Expression)
        |}
      """.stripMargin
   }
+
+  override protected def withNewChildrenInternal(
+      newFirst: Expression, newSecond: Expression, newThird: Expression): Slice =
+    copy(x = newFirst, start = newSecond, length = newThird)
 }
 
 /**
@@ -1548,7 +1575,9 @@ case class Slice(x: Expression, start: Expression, length: Expression)
        hello world
       > SELECT _FUNC_(array('hello', null ,'world'), ' ', ',');
        hello , world
-  """, since = "2.4.0")
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
 case class ArrayJoin(
     array: Expression,
     delimiter: Expression,
@@ -1570,6 +1599,16 @@ case class ArrayJoin(
   } else {
     Seq(array, delimiter)
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    if (nullReplacement.isDefined) {
+      copy(
+        array = newChildren(0),
+        delimiter = newChildren(1),
+        nullReplacement = Some(newChildren(2)))
+    } else {
+      copy(array = newChildren(0), delimiter = newChildren(1))
+    }
 
   override def nullable: Boolean = children.exists(_.nullable)
 
@@ -1711,8 +1750,11 @@ case class ArrayJoin(
     Examples:
       > SELECT _FUNC_(array(1, 20, null, 3));
        1
-  """, since = "2.4.0")
-case class ArrayMin(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
+case class ArrayMin(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def nullable: Boolean = true
 
@@ -1765,6 +1807,9 @@ case class ArrayMin(child: Expression) extends UnaryExpression with ImplicitCast
   }
 
   override def prettyName: String = "array_min"
+
+  override protected def withNewChildInternal(newChild: Expression): ArrayMin =
+    copy(child = newChild)
 }
 
 /**
@@ -1776,8 +1821,11 @@ case class ArrayMin(child: Expression) extends UnaryExpression with ImplicitCast
     Examples:
       > SELECT _FUNC_(array(1, 20, null, 3));
        20
-  """, since = "2.4.0")
-case class ArrayMax(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
+case class ArrayMax(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def nullable: Boolean = true
 
@@ -1830,6 +1878,9 @@ case class ArrayMax(child: Expression) extends UnaryExpression with ImplicitCast
   }
 
   override def prettyName: String = "array_max"
+
+  override protected def withNewChildInternal(newChild: Expression): ArrayMax =
+    copy(child = newChild)
 }
 
 
@@ -1850,9 +1901,10 @@ case class ArrayMax(child: Expression) extends UnaryExpression with ImplicitCast
       > SELECT _FUNC_(array(3, 2, 1), 1);
        3
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArrayPosition(left: Expression, right: Expression)
-  extends BinaryExpression with ImplicitCastInputTypes {
+  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   @transient private lazy val ordering: Ordering[Any] =
     TypeUtils.getInterpretedOrdering(right.dataType)
@@ -1908,6 +1960,10 @@ case class ArrayPosition(left: Expression, right: Expression)
        """.stripMargin
     })
   }
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): ArrayPosition =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -1916,10 +1972,14 @@ case class ArrayPosition(left: Expression, right: Expression)
 @ExpressionDescription(
   usage = """
     _FUNC_(array, index) - Returns element of array at given (1-based) index. If index < 0,
-      accesses elements from the last to the first. Returns NULL if the index exceeds the length
-      of the array.
+      accesses elements from the last to the first. The function returns NULL
+      if the index exceeds the length of the array and `spark.sql.ansi.enabled` is set to false.
+      If `spark.sql.ansi.enabled` is set to true, it throws ArrayIndexOutOfBoundsException
+      for invalid indices.
 
-    _FUNC_(map, key) - Returns value for given key, or NULL if the key is not contained in the map
+    _FUNC_(map, key) - Returns value for given key. The function returns NULL
+      if the key is not contained in the map and `spark.sql.ansi.enabled` is set to false.
+      If `spark.sql.ansi.enabled` is set to true, it throws NoSuchElementException instead.
   """,
   examples = """
     Examples:
@@ -1928,11 +1988,20 @@ case class ArrayPosition(left: Expression, right: Expression)
       > SELECT _FUNC_(map(1, 'a', 2, 'b'), 2);
        b
   """,
-  since = "2.4.0")
-case class ElementAt(left: Expression, right: Expression)
-  extends GetMapValueUtil with GetArrayItemUtil {
+  since = "2.4.0",
+  group = "map_funcs")
+case class ElementAt(
+    left: Expression,
+    right: Expression,
+    failOnError: Boolean = SQLConf.get.ansiEnabled)
+  extends GetMapValueUtil with GetArrayItemUtil with NullIntolerant {
+
+  def this(left: Expression, right: Expression) = this(left, right, SQLConf.get.ansiEnabled)
 
   @transient private lazy val mapKeyType = left.dataType.asInstanceOf[MapType].keyType
+
+  @transient private lazy val mapValueContainsNull =
+    left.dataType.asInstanceOf[MapType].valueContainsNull
 
   @transient private lazy val arrayContainsNull = left.dataType.asInstanceOf[ArrayType].containsNull
 
@@ -1975,9 +2044,24 @@ case class ElementAt(left: Expression, right: Expression)
     }
   }
 
+  private def nullability(elements: Seq[Expression], ordinal: Int): Boolean = {
+    if (ordinal == 0) {
+      false
+    } else if (elements.length < math.abs(ordinal)) {
+      !failOnError
+    } else {
+      if (ordinal < 0) {
+        elements(elements.length + ordinal).nullable
+      } else {
+        elements(ordinal - 1).nullable
+      }
+    }
+  }
+
   override def nullable: Boolean = left.dataType match {
-    case _: ArrayType => computeNullabilityFromArray(left, right)
-    case _: MapType => true
+    case _: ArrayType =>
+      computeNullabilityFromArray(left, right, failOnError, nullability)
+    case _: MapType => if (failOnError) mapValueContainsNull else true
   }
 
   override def nullSafeEval(value: Any, ordinal: Any): Any = doElementAt(value, ordinal)
@@ -1988,7 +2072,12 @@ case class ElementAt(left: Expression, right: Expression)
         val array = value.asInstanceOf[ArrayData]
         val index = ordinal.asInstanceOf[Int]
         if (array.numElements() < math.abs(index)) {
-          null
+          if (failOnError) {
+            throw new ArrayIndexOutOfBoundsException(
+              s"Invalid index: $index, numElements: ${array.numElements()}")
+          } else {
+            null
+          }
         } else {
           val idx = if (index == 0) {
             throw new ArrayIndexOutOfBoundsException("SQL array indices start at 1")
@@ -2005,7 +2094,7 @@ case class ElementAt(left: Expression, right: Expression)
         }
       }
     case _: MapType =>
-      (value, ordinal) => getValueEval(value, ordinal, mapKeyType, ordering)
+      (value, ordinal) => getValueEval(value, ordinal, mapKeyType, ordering, failOnError)
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
@@ -2022,10 +2111,20 @@ case class ElementAt(left: Expression, right: Expression)
           } else {
             ""
           }
+
+          val indexOutOfBoundBranch = if (failOnError) {
+            s"""throw new ArrayIndexOutOfBoundsException(
+               |  "Invalid index: " + $index + ", numElements: " + $eval1.numElements()
+               |);
+             """.stripMargin
+          } else {
+            s"${ev.isNull} = true;"
+          }
+
           s"""
              |int $index = (int) $eval2;
              |if ($eval1.numElements() < Math.abs($index)) {
-             |  ${ev.isNull} = true;
+             |  $indexOutOfBoundBranch
              |} else {
              |  if ($index == 0) {
              |    throw new ArrayIndexOutOfBoundsException("SQL array indices start at 1");
@@ -2042,11 +2141,14 @@ case class ElementAt(left: Expression, right: Expression)
            """.stripMargin
         })
       case _: MapType =>
-        doGetValueGenCode(ctx, ev, left.dataType.asInstanceOf[MapType])
+        doGetValueGenCode(ctx, ev, left.dataType.asInstanceOf[MapType], failOnError)
     }
   }
 
   override def prettyName: String = "element_at"
+
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): ElementAt = copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -2064,10 +2166,14 @@ case class ElementAt(left: Expression, right: Expression)
   """,
   note = """
     Concat logic for arrays is available since 2.4.0.
-  """)
+  """,
+  group = "collection_funcs",
+  since = "1.5.0")
 case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpression {
 
   private def allowedTypes: Seq[AbstractDataType] = Seq(StringType, BinaryType, ArrayType)
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(CONCAT)
 
   override def checkInputDataTypes(): TypeCheckResult = {
     if (children.isEmpty) {
@@ -2251,6 +2357,9 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
   override def toString: String = s"concat(${children.mkString(", ")})"
 
   override def sql: String = s"concat(${children.map(_.sql).mkString(", ")})"
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Concat =
+    copy(children = newChildren)
 }
 
 /**
@@ -2263,8 +2372,9 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
       > SELECT _FUNC_(array(array(1, 2), array(3, 4)));
        [1,2,3,4]
   """,
+  group = "array_funcs",
   since = "2.4.0")
-case class Flatten(child: Expression) extends UnaryExpression {
+case class Flatten(child: Expression) extends UnaryExpression with NullIntolerant {
 
   private def childDataType: ArrayType = child.dataType.asInstanceOf[ArrayType]
 
@@ -2362,6 +2472,9 @@ case class Flatten(child: Expression) extends UnaryExpression {
   }
 
   override def prettyName: String = "flatten"
+
+  override protected def withNewChildInternal(newChild: Expression): Flatten =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
@@ -2374,8 +2487,8 @@ case class Flatten(child: Expression) extends UnaryExpression {
 
       The start and stop expressions must resolve to the same type.
       If start and stop expressions resolve to the 'date' or 'timestamp' type
-      then the step expression must resolve to the 'interval' type, otherwise to the same type
-      as the start and stop expressions.
+      then the step expression must resolve to the 'interval' or 'year-month interval' or
+      'day-time interval' type, otherwise to the same type as the start and stop expressions.
   """,
   arguments = """
     Arguments:
@@ -2394,7 +2507,10 @@ case class Flatten(child: Expression) extends UnaryExpression {
        [5,4,3,2,1]
       > SELECT _FUNC_(to_date('2018-01-01'), to_date('2018-03-01'), interval 1 month);
        [2018-01-01,2018-02-01,2018-03-01]
+      > SELECT _FUNC_(to_date('2018-01-01'), to_date('2018-03-01'), interval '0-1' year to month);
+       [2018-01-01,2018-02-01,2018-03-01]
   """,
+  group = "array_funcs",
   since = "2.4.0"
 )
 case class Sequence(
@@ -2418,6 +2534,15 @@ case class Sequence(
 
   override def children: Seq[Expression] = Seq(start, stop) ++ stepOpt
 
+  override def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): TimeZoneAwareExpression = {
+    if (stepOpt.isDefined) {
+      copy(start = newChildren(0), stop = newChildren(1), stepOpt = Some(newChildren(2)))
+    } else {
+      copy(start = newChildren(0), stop = newChildren(1))
+    }
+  }
+
   override def foldable: Boolean = children.forall(_.foldable)
 
   override def nullable: Boolean = children.exists(_.nullable)
@@ -2430,8 +2555,13 @@ case class Sequence(
     val typesCorrect =
       startType.sameType(stop.dataType) &&
         (startType match {
-          case TimestampType | DateType =>
-            stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepType)
+          case TimestampType =>
+            stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepType) ||
+              YearMonthIntervalType.acceptsType(stepType) ||
+              DayTimeIntervalType.acceptsType(stepType)
+          case DateType =>
+            stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepType) ||
+              YearMonthIntervalType.acceptsType(stepType)
           case _: IntegralType =>
             stepOpt.isEmpty || stepType.sameType(startType)
           case _ => false
@@ -2441,29 +2571,51 @@ case class Sequence(
       TypeCheckResult.TypeCheckSuccess
     } else {
       TypeCheckResult.TypeCheckFailure(
-        s"$prettyName only supports integral, timestamp or date types")
+        s"""
+           |$prettyName uses the wrong parameter type. The parameter type must conform to:
+           |1. The start and stop expressions must resolve to the same type.
+           |2. If start and stop expressions resolve to the 'date' or 'timestamp' type
+           |then the step expression must resolve to the 'interval' or
+           |'${YearMonthIntervalType.typeName}' or '${DayTimeIntervalType.typeName}' type,
+           |otherwise to the same type as the start and stop expressions.
+         """.stripMargin)
     }
   }
 
-  def coercibleChildren: Seq[Expression] = children.filter(_.dataType != CalendarIntervalType)
+  private def isNotIntervalType(expr: Expression) = expr.dataType match {
+    case CalendarIntervalType | YearMonthIntervalType | DayTimeIntervalType => false
+    case _ => true
+  }
+
+  def coercibleChildren: Seq[Expression] = children.filter(isNotIntervalType)
 
   def castChildrenTo(widerType: DataType): Expression = Sequence(
     Cast(start, widerType),
     Cast(stop, widerType),
-    stepOpt.map(step => if (step.dataType != CalendarIntervalType) Cast(step, widerType) else step),
+    stepOpt.map(step => if (isNotIntervalType(step)) Cast(step, widerType) else step),
     timeZoneId)
 
-  @transient private lazy val impl: SequenceImpl = dataType.elementType match {
+  @transient private lazy val impl: InternalSequence = dataType.elementType match {
     case iType: IntegralType =>
       type T = iType.InternalType
       val ct = ClassTag[T](iType.tag.mirror.runtimeClass(iType.tag.tpe))
       new IntegralSequenceImpl(iType)(ct, iType.integral)
 
     case TimestampType =>
-      new TemporalSequenceImpl[Long](LongType, 1, identity, zoneId)
+      if (stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepOpt.get.dataType)) {
+        new TemporalSequenceImpl[Long](LongType, 1, identity, zoneId)
+      } else if (YearMonthIntervalType.acceptsType(stepOpt.get.dataType)) {
+        new PeriodSequenceImpl[Long](LongType, 1, identity, zoneId)
+      } else {
+        new DurationSequenceImpl[Long](LongType, 1, identity, zoneId)
+      }
 
     case DateType =>
-      new TemporalSequenceImpl[Int](IntegerType, MICROS_PER_DAY, _.toInt, zoneId)
+      if (stepOpt.isEmpty || CalendarIntervalType.acceptsType(stepOpt.get.dataType)) {
+        new TemporalSequenceImpl[Int](IntegerType, MICROS_PER_DAY, _.toInt, zoneId)
+      } else {
+        new PeriodSequenceImpl[Int](IntegerType, MICROS_PER_DAY, _.toInt, zoneId)
+      }
   }
 
   override def eval(input: InternalRow): Any = {
@@ -2546,7 +2698,7 @@ object Sequence {
     }
   }
 
-  private trait SequenceImpl {
+  private trait InternalSequence {
     def eval(start: Any, stop: Any, step: Any): Any
 
     def genCode(
@@ -2561,7 +2713,7 @@ object Sequence {
   }
 
   private class IntegralSequenceImpl[T: ClassTag]
-    (elemType: IntegralType)(implicit num: Integral[T]) extends SequenceImpl {
+    (elemType: IntegralType)(implicit num: Integral[T]) extends InternalSequence {
 
     override val defaultStep: DefaultStep = new DefaultStep(
       (elemType.ordering.lteq _).asInstanceOf[LessThanOrEqualFn],
@@ -2575,7 +2727,7 @@ object Sequence {
       val stop = input2.asInstanceOf[T]
       val step = input3.asInstanceOf[T]
 
-      var i: Int = getSequenceLength(start, stop, step)
+      var i: Int = getSequenceLength(start, stop, step, step)
       val arr = new Array[T](i)
       while (i > 0) {
         i -= 1
@@ -2593,7 +2745,7 @@ object Sequence {
         elemType: String): String = {
       val i = ctx.freshName("i")
       s"""
-         |${genSequenceLengthCode(ctx, start, stop, step, i)}
+         |${genSequenceLengthCode(ctx, start, stop, step, step, i)}
          |$arr = new $elemType[$i];
          |while ($i > 0) {
          |  $i--;
@@ -2603,38 +2755,127 @@ object Sequence {
     }
   }
 
+  private class PeriodSequenceImpl[T: ClassTag]
+      (dt: IntegralType, scale: Long, fromLong: Long => T, zoneId: ZoneId)
+      (implicit num: Integral[T]) extends InternalSequenceBase(dt, scale, fromLong, zoneId) {
+
+    override val defaultStep: DefaultStep = new DefaultStep(
+      (dt.ordering.lteq _).asInstanceOf[LessThanOrEqualFn],
+      YearMonthIntervalType,
+      Period.of(0, 1, 0))
+
+    val intervalType: DataType = YearMonthIntervalType
+
+    def splitStep(input: Any): (Int, Int, Long) = {
+      (input.asInstanceOf[Int], 0, 0)
+    }
+
+    def stepSplitCode(
+        stepMonths: String, stepDays: String, stepMicros: String, step: String): String = {
+      s"""
+         |final int $stepMonths = $step;
+         |final int $stepDays = 0;
+         |final long $stepMicros = 0L;
+       """.stripMargin
+    }
+  }
+
+  private class DurationSequenceImpl[T: ClassTag]
+      (dt: IntegralType, scale: Long, fromLong: Long => T, zoneId: ZoneId)
+      (implicit num: Integral[T]) extends InternalSequenceBase(dt, scale, fromLong, zoneId) {
+
+    override val defaultStep: DefaultStep = new DefaultStep(
+      (dt.ordering.lteq _).asInstanceOf[LessThanOrEqualFn],
+      DayTimeIntervalType,
+      Duration.ofDays(1))
+
+    val intervalType: DataType = DayTimeIntervalType
+
+    def splitStep(input: Any): (Int, Int, Long) = {
+      (0, 0, input.asInstanceOf[Long])
+    }
+
+    def stepSplitCode(
+        stepMonths: String, stepDays: String, stepMicros: String, step: String): String = {
+      s"""
+         |final int $stepMonths = 0;
+         |final int $stepDays = 0;
+         |final long $stepMicros = $step;
+       """.stripMargin
+    }
+  }
+
   private class TemporalSequenceImpl[T: ClassTag]
       (dt: IntegralType, scale: Long, fromLong: Long => T, zoneId: ZoneId)
-      (implicit num: Integral[T]) extends SequenceImpl {
+      (implicit num: Integral[T]) extends InternalSequenceBase(dt, scale, fromLong, zoneId) {
 
     override val defaultStep: DefaultStep = new DefaultStep(
       (dt.ordering.lteq _).asInstanceOf[LessThanOrEqualFn],
       CalendarIntervalType,
-      new CalendarInterval(0, MICROS_PER_DAY))
+      new CalendarInterval(0, 1, 0))
+
+    val intervalType: DataType = CalendarIntervalType
+
+    def splitStep(input: Any): (Int, Int, Long) = {
+      val step = input.asInstanceOf[CalendarInterval]
+      (step.months, step.days, step.microseconds)
+    }
+
+    def stepSplitCode(
+        stepMonths: String, stepDays: String, stepMicros: String, step: String): String = {
+      s"""
+         |final int $stepMonths = $step.months;
+         |final int $stepDays = $step.days;
+         |final long $stepMicros = $step.microseconds;
+       """.stripMargin
+    }
+  }
+
+  private abstract class InternalSequenceBase[T: ClassTag]
+      (dt: IntegralType, scale: Long, fromLong: Long => T, zoneId: ZoneId)
+      (implicit num: Integral[T]) extends InternalSequence {
+
+    val defaultStep: DefaultStep
 
     private val backedSequenceImpl = new IntegralSequenceImpl[T](dt)
-    private val microsPerMonth = 28 * CalendarInterval.MICROS_PER_DAY
+    // We choose a minimum days(28) in one month to calculate the `intervalStepInMicros`
+    // in order to make sure the estimated array length is long enough
+    private val microsPerMonth = 28 * MICROS_PER_DAY
+
+    protected val intervalType: DataType
+
+    protected def splitStep(input: Any): (Int, Int, Long)
 
     override def eval(input1: Any, input2: Any, input3: Any): Array[T] = {
       val start = input1.asInstanceOf[T]
       val stop = input2.asInstanceOf[T]
-      val step = input3.asInstanceOf[CalendarInterval]
-      val stepMonths = step.months
-      val stepMicros = step.microseconds
+      val (stepMonths, stepDays, stepMicros) = splitStep(input3)
 
-      if (stepMonths == 0) {
-        backedSequenceImpl.eval(start, stop, fromLong(stepMicros / scale))
+      if (scale == MICROS_PER_DAY && stepMonths == 0 && stepDays == 0) {
+        throw new IllegalArgumentException(
+          s"sequence step must be a day ${intervalType.typeName} if start and end values are dates")
+      }
+
+      if (stepMonths == 0 && stepMicros == 0 && scale == MICROS_PER_DAY) {
+        // Adding pure days to date start/end
+        backedSequenceImpl.eval(start, stop, fromLong(stepDays))
+
+      } else if (stepMonths == 0 && stepDays == 0 && scale == 1) {
+        // Adding pure microseconds to timestamp start/end
+        backedSequenceImpl.eval(start, stop, fromLong(stepMicros))
 
       } else {
         // To estimate the resulted array length we need to make assumptions
-        // about a month length in microseconds
-        val intervalStepInMicros = stepMicros + stepMonths * microsPerMonth
+        // about a month length in days and a day length in microseconds
+        val intervalStepInMicros =
+          stepMicros + stepMonths * microsPerMonth + stepDays * MICROS_PER_DAY
         val startMicros: Long = num.toLong(start) * scale
         val stopMicros: Long = num.toLong(stop) * scale
-        val maxEstimatedArrayLength =
-          getSequenceLength(startMicros, stopMicros, intervalStepInMicros)
 
-        val stepSign = if (stopMicros > startMicros) +1 else -1
+        val maxEstimatedArrayLength =
+          getSequenceLength(startMicros, stopMicros, input3, intervalStepInMicros)
+
+        val stepSign = if (stopMicros >= startMicros) +1 else -1
         val exclusiveItem = stopMicros + stepSign
         val arr = new Array[T](maxEstimatedArrayLength)
         var t = startMicros
@@ -2643,13 +2884,17 @@ object Sequence {
         while (t < exclusiveItem ^ stepSign < 0) {
           arr(i) = fromLong(t / scale)
           i += 1
-          t = timestampAddInterval(startMicros, i * stepMonths, i * stepMicros, zoneId)
+          t = timestampAddInterval(
+            startMicros, i * stepMonths, i * stepDays, i * stepMicros, zoneId)
         }
 
         // truncate array to the correct length
         if (arr.length == i) arr else arr.slice(0, i)
       }
     }
+
+    protected def stepSplitCode(
+         stepMonths: String, stepDays: String, stepMicros: String, step: String): String
 
     override def genCode(
         ctx: CodegenContext,
@@ -2659,6 +2904,7 @@ object Sequence {
         arr: String,
         elemType: String): String = {
       val stepMonths = ctx.freshName("stepMonths")
+      val stepDays = ctx.freshName("stepDays")
       val stepMicros = ctx.freshName("stepMicros")
       val stepScaled = ctx.freshName("stepScaled")
       val intervalInMicros = ctx.freshName("intervalInMicros")
@@ -2673,25 +2919,43 @@ object Sequence {
 
       val sequenceLengthCode =
         s"""
-           |final long $intervalInMicros = $stepMicros + $stepMonths * ${microsPerMonth}L;
-           |${genSequenceLengthCode(ctx, startMicros, stopMicros, intervalInMicros, arrLength)}
-          """.stripMargin
+           |final long $intervalInMicros =
+           |  $stepMicros + $stepMonths * ${microsPerMonth}L + $stepDays * ${MICROS_PER_DAY}L;
+           |${genSequenceLengthCode(
+              ctx, startMicros, stopMicros, step, intervalInMicros, arrLength)}
+         """.stripMargin
+
+      val check = if (scale == MICROS_PER_DAY) {
+        s"""
+           |if ($stepMonths == 0 && $stepDays == 0) {
+           |  throw new IllegalArgumentException(
+           |    "sequence step must be a day ${intervalType.typeName} " +
+           |    "if start and end values are dates");
+           |}
+         """.stripMargin
+        } else {
+          ""
+        }
+
+      val stepSplits = stepSplitCode(stepMonths, stepDays, stepMicros, step)
 
       s"""
-         |final int $stepMonths = $step.months;
-         |final long $stepMicros = $step.microseconds;
+         |$stepSplits
          |
-         |if ($stepMonths == 0) {
-         |  final $elemType $stepScaled = ($elemType) ($stepMicros / ${scale}L);
-         |  ${backedSequenceImpl.genCode(ctx, start, stop, stepScaled, arr, elemType)};
+         |$check
          |
+         |if ($stepMonths == 0 && $stepMicros == 0 && ${scale}L == ${MICROS_PER_DAY}L) {
+         |  ${backedSequenceImpl.genCode(ctx, start, stop, stepDays, arr, elemType)};
+         |
+         |} else if ($stepMonths == 0 && $stepDays == 0 && ${scale}L == 1) {
+         |  ${backedSequenceImpl.genCode(ctx, start, stop, stepMicros, arr, elemType)};
          |} else {
          |  final long $startMicros = $start * ${scale}L;
          |  final long $stopMicros = $stop * ${scale}L;
          |
          |  $sequenceLengthCode
          |
-         |  final int $stepSign = $stopMicros > $startMicros ? +1 : -1;
+         |  final int $stepSign = $stopMicros >= $startMicros ? +1 : -1;
          |  final long $exclusiveItem = $stopMicros + $stepSign;
          |
          |  $arr = new $elemType[$arrLength];
@@ -2702,7 +2966,7 @@ object Sequence {
          |    $arr[$i] = ($elemType) ($t / ${scale}L);
          |    $i += 1;
          |    $t = org.apache.spark.sql.catalyst.util.DateTimeUtils.timestampAddInterval(
-         |       $startMicros, $i * $stepMonths, $i * $stepMicros, $zid);
+         |       $startMicros, $i * $stepMonths, $i * $stepDays, $i * $stepMicros, $zid);
          |  }
          |
          |  if ($arr.length > $i) {
@@ -2713,15 +2977,16 @@ object Sequence {
     }
   }
 
-  private def getSequenceLength[U](start: U, stop: U, step: U)(implicit num: Integral[U]): Int = {
+  private def getSequenceLength[U](start: U, stop: U, step: Any, estimatedStep: U)
+      (implicit num: Integral[U]): Int = {
     import num._
     require(
-      (step > num.zero && start <= stop)
-        || (step < num.zero && start >= stop)
-        || (step == num.zero && start == stop),
+      (estimatedStep > num.zero && start <= stop)
+        || (estimatedStep < num.zero && start >= stop)
+        || (estimatedStep == num.zero && start == stop),
       s"Illegal sequence boundaries: $start to $stop by $step")
 
-    val len = if (start == stop) 1L else 1L + (stop.toLong - start.toLong) / step.toLong
+    val len = if (start == stop) 1L else 1L + (stop.toLong - start.toLong) / estimatedStep.toLong
 
     require(
       len <= MAX_ROUNDED_ARRAY_LENGTH,
@@ -2735,16 +3000,17 @@ object Sequence {
       start: String,
       stop: String,
       step: String,
+      estimatedStep: String,
       len: String): String = {
     val longLen = ctx.freshName("longLen")
     s"""
-       |if (!(($step > 0 && $start <= $stop) ||
-       |  ($step < 0 && $start >= $stop) ||
-       |  ($step == 0 && $start == $stop))) {
+       |if (!(($estimatedStep > 0 && $start <= $stop) ||
+       |  ($estimatedStep < 0 && $start >= $stop) ||
+       |  ($estimatedStep == 0 && $start == $stop))) {
        |  throw new IllegalArgumentException(
        |    "Illegal sequence boundaries: " + $start + " to " + $stop + " by " + $step);
        |}
-       |long $longLen = $stop == $start ? 1L : 1L + ((long) $stop - $start) / $step;
+       |long $longLen = $stop == $start ? 1L : 1L + ((long) $stop - $start) / $estimatedStep;
        |if ($longLen > $MAX_ROUNDED_ARRAY_LENGTH) {
        |  throw new IllegalArgumentException(
        |    "Too long sequence: " + $longLen + ". Should be <= $MAX_ROUNDED_ARRAY_LENGTH");
@@ -2764,6 +3030,7 @@ object Sequence {
       > SELECT _FUNC_('123', 2);
        ["123","123"]
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArrayRepeat(left: Expression, right: Expression)
   extends BinaryExpression with ExpectsInputTypes {
@@ -2873,6 +3140,8 @@ case class ArrayRepeat(left: Expression, right: Expression)
      """.stripMargin
   }
 
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): ArrayRepeat = copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -2884,9 +3153,11 @@ case class ArrayRepeat(left: Expression, right: Expression)
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, null, 3), 3);
        [1,2,null]
-  """, since = "2.4.0")
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
 case class ArrayRemove(left: Expression, right: Expression)
-  extends BinaryExpression with ImplicitCastInputTypes {
+  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = left.dataType
 
@@ -2985,6 +3256,9 @@ case class ArrayRemove(left: Expression, right: Expression)
   }
 
   override def prettyName: String = "array_remove"
+
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): ArrayRemove = copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -3028,6 +3302,7 @@ trait ArraySetLike {
   @transient protected lazy val nullValueHolder = et match {
     case ByteType => "(byte) 0"
     case ShortType => "(short) 0"
+    case LongType => "(long) 0"
     case _ => "0"
   }
 
@@ -3079,9 +3354,11 @@ trait ArraySetLike {
     Examples:
       > SELECT _FUNC_(array(1, 2, 3, null, 3));
        [1,2,3,null]
-  """, since = "2.4.0")
+  """,
+  group = "array_funcs",
+  since = "2.4.0")
 case class ArrayDistinct(child: Expression)
-  extends UnaryExpression with ArraySetLike with ExpectsInputTypes {
+  extends UnaryExpression with ArraySetLike with ExpectsInputTypes with NullIntolerant {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType)
 
@@ -3131,7 +3408,7 @@ case class ArrayDistinct(child: Expression)
           }
         }
       }
-      new GenericArrayData(arrayBuffer)
+      new GenericArrayData(arrayBuffer.toSeq)
     }
   }
 
@@ -3214,12 +3491,16 @@ case class ArrayDistinct(child: Expression)
   }
 
   override def prettyName: String = "array_distinct"
+
+  override protected def withNewChildInternal(newChild: Expression): ArrayDistinct =
+    copy(child = newChild)
 }
 
 /**
  * Will become common base class for [[ArrayUnion]], [[ArrayIntersect]], and [[ArrayExcept]].
  */
-trait ArrayBinaryLike extends BinaryArrayExpressionWithImplicitCast with ArraySetLike {
+trait ArrayBinaryLike
+  extends BinaryArrayExpressionWithImplicitCast with ArraySetLike with NullIntolerant {
   override protected def dt: DataType = dataType
   override protected def et: DataType = elementType
 
@@ -3256,6 +3537,7 @@ object ArrayBinaryLike {
       > SELECT _FUNC_(array(1, 2, 3), array(1, 3, 5));
        [1,2,3,5]
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLike
   with ComplexTypeMergingExpression {
@@ -3287,7 +3569,7 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
             i += 1
           }
         }
-        new GenericArrayData(arrayBuffer)
+        new GenericArrayData(arrayBuffer.toSeq)
     } else {
       (array1, array2) =>
         val arrayBuffer = new scala.collection.mutable.ArrayBuffer[Any]
@@ -3318,7 +3600,7 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
             arrayBuffer += elem
           }
         }))
-        new GenericArrayData(arrayBuffer)
+        new GenericArrayData(arrayBuffer.toSeq)
     }
   }
 
@@ -3414,6 +3696,9 @@ case class ArrayUnion(left: Expression, right: Expression) extends ArrayBinaryLi
   }
 
   override def prettyName: String = "array_union"
+
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): ArrayUnion = copy(left = newLeft, right = newRight)
 }
 
 object ArrayUnion {
@@ -3450,7 +3735,7 @@ object ArrayUnion {
         arrayBuffer += elem
       }
     }))
-    new GenericArrayData(arrayBuffer)
+    new GenericArrayData(arrayBuffer.toSeq)
   }
 }
 
@@ -3467,15 +3752,19 @@ object ArrayUnion {
       > SELECT _FUNC_(array(1, 2, 3), array(1, 3, 5));
        [1,3]
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBinaryLike
   with ComplexTypeMergingExpression {
-  override def dataType: DataType = {
+
+  private lazy val internalDataType: DataType = {
     dataTypeCheck
     ArrayType(elementType,
       left.dataType.asInstanceOf[ArrayType].containsNull &&
         right.dataType.asInstanceOf[ArrayType].containsNull)
   }
+
+  override def dataType: DataType = internalDataType
 
   @transient lazy val evalIntersect: (ArrayData, ArrayData) => ArrayData = {
     if (TypeUtils.typeWithProperEquals(elementType)) {
@@ -3511,7 +3800,7 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
             }
             i += 1
           }
-          new GenericArrayData(arrayBuffer)
+          new GenericArrayData(arrayBuffer.toSeq)
         } else {
           new GenericArrayData(Array.emptyObjectArray)
         }
@@ -3559,7 +3848,7 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
             }
             i += 1
           }
-          new GenericArrayData(arrayBuffer)
+          new GenericArrayData(arrayBuffer.toSeq)
         } else {
           new GenericArrayData(Array.emptyObjectArray)
         }
@@ -3693,6 +3982,10 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
   }
 
   override def prettyName: String = "array_intersect"
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): ArrayIntersect =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -3708,14 +4001,17 @@ case class ArrayIntersect(left: Expression, right: Expression) extends ArrayBina
       > SELECT _FUNC_(array(1, 2, 3), array(1, 3, 5));
        [2]
   """,
+  group = "array_funcs",
   since = "2.4.0")
 case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryLike
   with ComplexTypeMergingExpression {
 
-  override def dataType: DataType = {
+  private lazy val internalDataType: DataType = {
     dataTypeCheck
     left.dataType
   }
+
+  override def dataType: DataType = internalDataType
 
   @transient lazy val evalExcept: (ArrayData, ArrayData) => ArrayData = {
     if (TypeUtils.typeWithProperEquals(elementType)) {
@@ -3749,7 +4045,7 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
           }
           i += 1
         }
-        new GenericArrayData(arrayBuffer)
+        new GenericArrayData(arrayBuffer.toSeq)
     } else {
       (array1, array2) =>
         val arrayBuffer = new scala.collection.mutable.ArrayBuffer[Any]
@@ -3794,7 +4090,7 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
           }
           i += 1
         }
-        new GenericArrayData(arrayBuffer)
+        new GenericArrayData(arrayBuffer.toSeq)
     }
   }
 
@@ -3914,4 +4210,7 @@ case class ArrayExcept(left: Expression, right: Expression) extends ArrayBinaryL
   }
 
   override def prettyName: String = "array_except"
+
+  override protected def withNewChildrenInternal(
+    newLeft: Expression, newRight: Expression): ArrayExcept = copy(left = newLeft, right = newRight)
 }

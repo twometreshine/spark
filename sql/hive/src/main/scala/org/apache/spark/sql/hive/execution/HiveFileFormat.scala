@@ -108,7 +108,7 @@ class HiveFileFormat(fileSinkConf: FileSinkDesc)
 }
 
 class HiveOutputWriter(
-    path: String,
+    val path: String,
     fileSinkConf: FileSinkDesc,
     jobConf: JobConf,
     dataSchema: StructType) extends OutputWriter with HiveInspectors {
@@ -130,10 +130,15 @@ class HiveOutputWriter(
     new Path(path),
     Reporter.NULL)
 
+  /**
+   * Since SPARK-30201 ObjectInspectorCopyOption.JAVA change to ObjectInspectorCopyOption.DEFAULT.
+   * The reason is DEFAULT option can convert `UTF8String` to `Text` with bytes and
+   * we can compatible with non UTF-8 code bytes during write.
+   */
   private val standardOI = ObjectInspectorUtils
     .getStandardObjectInspector(
       tableDesc.getDeserializer(jobConf).getObjectInspector,
-      ObjectInspectorCopyOption.JAVA)
+      ObjectInspectorCopyOption.DEFAULT)
     .asInstanceOf[StructObjectInspector]
 
   private val fieldOIs =

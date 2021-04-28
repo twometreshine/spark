@@ -347,7 +347,6 @@ private[python] class PythonMLLibAPI extends Serializable {
       data: JavaRDD[Vector],
       k: Int,
       maxIterations: Int,
-      runs: Int,
       initializationMode: String,
       seed: java.lang.Long,
       initializationSteps: Int,
@@ -408,11 +407,7 @@ private[python] class PythonMLLibAPI extends Serializable {
 
     if (seed != null) gmmAlg.setSeed(seed)
 
-    try {
-      new GaussianMixtureModelWrapper(gmmAlg.run(data.rdd.persist(StorageLevel.MEMORY_AND_DISK)))
-    } finally {
-      data.rdd.unpersist()
-    }
+    new GaussianMixtureModelWrapper(gmmAlg.run(data.rdd))
   }
 
   /**
@@ -1228,28 +1223,28 @@ private[python] class PythonMLLibAPI extends Serializable {
    * Python-friendly version of [[MLUtils.convertVectorColumnsToML()]].
    */
   def convertVectorColumnsToML(dataset: DataFrame, cols: JArrayList[String]): DataFrame = {
-    MLUtils.convertVectorColumnsToML(dataset, cols.asScala: _*)
+    MLUtils.convertVectorColumnsToML(dataset, cols.asScala.toSeq: _*)
   }
 
   /**
    * Python-friendly version of [[MLUtils.convertVectorColumnsFromML()]]
    */
   def convertVectorColumnsFromML(dataset: DataFrame, cols: JArrayList[String]): DataFrame = {
-    MLUtils.convertVectorColumnsFromML(dataset, cols.asScala: _*)
+    MLUtils.convertVectorColumnsFromML(dataset, cols.asScala.toSeq: _*)
   }
 
   /**
    * Python-friendly version of [[MLUtils.convertMatrixColumnsToML()]].
    */
   def convertMatrixColumnsToML(dataset: DataFrame, cols: JArrayList[String]): DataFrame = {
-    MLUtils.convertMatrixColumnsToML(dataset, cols.asScala: _*)
+    MLUtils.convertMatrixColumnsToML(dataset, cols.asScala.toSeq: _*)
   }
 
   /**
    * Python-friendly version of [[MLUtils.convertMatrixColumnsFromML()]]
    */
   def convertMatrixColumnsFromML(dataset: DataFrame, cols: JArrayList[String]): DataFrame = {
-    MLUtils.convertMatrixColumnsFromML(dataset, cols.asScala: _*)
+    MLUtils.convertMatrixColumnsFromML(dataset, cols.asScala.toSeq: _*)
   }
 }
 
@@ -1312,14 +1307,16 @@ private[spark] abstract class SerDeBase {
       }
     }
 
-    private[python] def saveState(obj: Object, out: OutputStream, pickler: Pickler)
+    private[python] def saveState(obj: Object, out: OutputStream, pickler: Pickler): Unit
   }
 
   def dumps(obj: AnyRef): Array[Byte] = {
     obj match {
       // Pickler in Python side cannot deserialize Scala Array normally. See SPARK-12834.
-      case array: Array[_] => new Pickler().dumps(array.toSeq.asJava)
-      case _ => new Pickler().dumps(obj)
+      case array: Array[_] => new Pickler(/* useMemo = */ true,
+        /* valueCompare = */ false).dumps(array.toSeq.asJava)
+      case _ => new Pickler(/* useMemo = */ true,
+        /* valueCompare = */ false).dumps(obj)
     }
   }
 

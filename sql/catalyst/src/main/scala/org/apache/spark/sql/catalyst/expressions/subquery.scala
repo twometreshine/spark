@@ -22,12 +22,29 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{EXISTS_SUBQUERY, LIST_SUBQUERY,
+  PLAN_EXPRESSION, SCALAR_SUBQUERY, TreePattern}
 import org.apache.spark.sql.types._
+import org.apache.spark.util.collection.BitSet
 
 /**
  * An interface for expressions that contain a [[QueryPlan]].
  */
 abstract class PlanExpression[T <: QueryPlan[_]] extends Expression {
+
+  // Override `treePatternBits` to propagate bits for its internal plan.
+  override lazy val treePatternBits: BitSet = {
+    val bits: BitSet = getDefaultTreePatternBits
+    // Propagate its query plan's pattern bits
+    bits.union(plan.treePatternBits)
+    bits
+  }
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(PLAN_EXPRESSION) ++ nodePatternsInternal
+
+  // Subclasses can override this function to provide more TreePatterns.
+  def nodePatternsInternal(): Seq[TreePattern] = Seq()
+
   /**  The id of the subquery expression. */
   def exprId: ExprId
 
@@ -36,9 +53,6 @@ abstract class PlanExpression[T <: QueryPlan[_]] extends Expression {
 
   /** Updates the expression with a new plan. */
   def withNewPlan(plan: T): PlanExpression[T]
-
-  /** Defines how the canonicalization should work for this expression. */
-  def canonicalize(attrs: AttributeSeq): PlanExpression[T]
 
   protected def conditionString: String = children.mkString("[", " && ", "]")
 }
@@ -61,22 +75,17 @@ abstract class SubqueryExpression(
         children.zip(p.children).forall(p => p._1.semanticEquals(p._2))
     case _ => false
   }
-  override def canonicalize(attrs: AttributeSeq): SubqueryExpression = {
-    // Normalize the outer references in the subquery plan.
-    val normalizedPlan = plan.transformAllExpressions {
-      case OuterReference(r) => OuterReference(QueryPlan.normalizeExprId(r, attrs))
-    }
-    withNewPlan(normalizedPlan).canonicalized.asInstanceOf[SubqueryExpression]
-  }
 }
 
 object SubqueryExpression {
   /**
-   * Returns true when an expression contains an IN or EXISTS subquery and false otherwise.
+   * Returns true when an expression contains an IN or correlated EXISTS subquery
+   * and false otherwise.
    */
-  def hasInOrExistsSubquery(e: Expression): Boolean = {
+  def hasInOrCorrelatedExistsSubquery(e: Expression): Boolean = {
     e.find {
-      case _: ListQuery | _: Exists => true
+      case _: ListQuery => true
+      case _: Exists if e.children.nonEmpty => true
       case _ => false
     }.isDefined
   }
@@ -114,24 +123,6 @@ object SubExprUtils extends PredicateHelper {
   }
 
   /**
-   * Returns whether there are any null-aware predicate subqueries inside Not. If not, we could
-   * turn the null-aware predicate into not-null-aware predicate.
-   */
-  def hasNullAwarePredicateWithinNot(condition: Expression): Boolean = {
-    splitConjunctivePredicates(condition).exists {
-      case _: Exists | Not(_: Exists) => false
-      case _: InSubquery | Not(_: InSubquery) => false
-      case e => e.find { x =>
-        x.isInstanceOf[Not] && e.find {
-          case _: InSubquery => true
-          case _ => false
-        }.isDefined
-      }.isDefined
-    }
-
-  }
-
-  /**
    * Returns an expression after removing the OuterReference shell.
    */
   def stripOuterReference(e: Expression): Expression = e.transform { case OuterReference(r) => r }
@@ -156,14 +147,11 @@ object SubExprUtils extends PredicateHelper {
    * Given a logical plan, returns TRUE if it has an outer reference and false otherwise.
    */
   def hasOuterReferences(plan: LogicalPlan): Boolean = {
-    plan.find {
-      case f: Filter => containsOuter(f.condition)
-      case other => false
-    }.isDefined
+    plan.find(_.expressions.exists(containsOuter)).isDefined
   }
 
   /**
-   * Given a list of expressions, returns the expressions which have outer references. Aggregate
+   * Given an expression, returns the expressions which have outer references. Aggregate
    * expressions are treated in a special way. If the children of aggregate expression contains an
    * outer reference, then the entire aggregate expression is marked as an outer reference.
    * Example (SQL):
@@ -199,20 +187,20 @@ object SubExprUtils extends PredicateHelper {
    * }}}
    * The code below needs to change when we support the above cases.
    */
-  def getOuterReferences(conditions: Seq[Expression]): Seq[Expression] = {
+  def getOuterReferences(expr: Expression): Seq[Expression] = {
     val outerExpressions = ArrayBuffer.empty[Expression]
-    conditions foreach { expr =>
-      expr transformDown {
-        case a: AggregateExpression if a.collectLeaves.forall(_.isInstanceOf[OuterReference]) =>
-          val newExpr = stripOuterReference(a)
-          outerExpressions += newExpr
-          newExpr
-        case OuterReference(e) =>
-          outerExpressions += e
-          e
-      }
+    expr transformDown {
+      case a: AggregateExpression if a.collectLeaves.forall(_.isInstanceOf[OuterReference]) =>
+        // Collect and update the sub-tree so that outer references inside this aggregate
+        // expression will not be collected. For example: min(outer(a)) -> min(a).
+        val newExpr = stripOuterReference(a)
+        outerExpressions += newExpr
+        newExpr
+      case OuterReference(e) =>
+        outerExpressions += e
+        e
     }
-    outerExpressions
+    outerExpressions.toSeq
   }
 
   /**
@@ -220,8 +208,7 @@ object SubExprUtils extends PredicateHelper {
    * Filter operator can host outer references.
    */
   def getOuterReferences(plan: LogicalPlan): Seq[Expression] = {
-    val conditions = plan.collect { case Filter(cond, _) => cond }
-    getOuterReferences(conditions)
+    plan.flatMap(_.expressions.flatMap(getOuterReferences))
   }
 
   /**
@@ -264,6 +251,11 @@ case class ScalarSubquery(
       children.map(_.canonicalized),
       ExprId(0))
   }
+
+  override protected def withNewChildrenInternal(
+    newChildren: IndexedSeq[Expression]): ScalarSubquery = copy(children = newChildren)
+
+  final override def nodePatternsInternal: Seq[TreePattern] = Seq(SCALAR_SUBQUERY)
 }
 
 object ScalarSubquery {
@@ -309,10 +301,18 @@ case class ListQuery(
       ExprId(0),
       childOutputs.map(_.canonicalized.asInstanceOf[Attribute]))
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): ListQuery =
+    copy(children = newChildren)
+
+  final override def nodePatternsInternal: Seq[TreePattern] = Seq(LIST_SUBQUERY)
 }
 
 /**
- * The [[Exists]] expression checks if a row exists in a subquery given some correlated condition.
+ * The [[Exists]] expression checks if a row exists in a subquery given some correlated condition
+ * or some uncorrelated condition.
+ *
+ * 1. correlated condition:
  *
  * For example (SQL):
  * {{{
@@ -321,6 +321,17 @@ case class ListQuery(
  *   WHERE   EXISTS (SELECT  *
  *                   FROM    b
  *                   WHERE   b.id = a.id)
+ * }}}
+ *
+ * 2. uncorrelated condition example:
+ *
+ * For example (SQL):
+ * {{{
+ *   SELECT  *
+ *   FROM    a
+ *   WHERE   EXISTS (SELECT  *
+ *                   FROM    b
+ *                   WHERE   b.id > 10)
  * }}}
  */
 case class Exists(
@@ -337,4 +348,9 @@ case class Exists(
       children.map(_.canonicalized),
       ExprId(0))
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Exists =
+    copy(children = newChildren)
+
+  final override def nodePatternsInternal: Seq[TreePattern] = Seq(EXISTS_SUBQUERY)
 }

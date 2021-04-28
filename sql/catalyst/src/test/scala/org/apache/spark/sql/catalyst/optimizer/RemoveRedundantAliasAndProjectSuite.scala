@@ -83,12 +83,12 @@ class RemoveRedundantAliasAndProjectSuite extends PlanTest with PredicateHelper 
     comparePlans(optimized, query)
   }
 
-  test("retain deduplicating alias in self-join") {
+  test("remove redundant project with self-join") {
     val relation = LocalRelation('a.int)
     val fragment = relation.select('a as 'a)
     val query = fragment.select('a as 'a).join(fragment.select('a as 'a)).analyze
     val optimized = Optimize.execute(query)
-    val expected = relation.join(relation.select('a as 'a)).analyze
+    val expected = relation.join(relation).analyze
     comparePlans(optimized, expected)
   }
 
@@ -119,9 +119,13 @@ class RemoveRedundantAliasAndProjectSuite extends PlanTest with PredicateHelper 
 
   test("do not remove output attributes from a subquery") {
     val relation = LocalRelation('a.int, 'b.int)
-    val query = Subquery(relation.select('a as "a", 'b as "b").where('b < 10).select('a).analyze)
+    val query = Subquery(
+      relation.select('a as "a", 'b as "b").where('b < 10).select('a).analyze,
+      correlated = false)
     val optimized = Optimize.execute(query)
-    val expected = Subquery(relation.select('a as "a", 'b).where('b < 10).select('a).analyze)
+    val expected = Subquery(
+      relation.select('a as "a", 'b).where('b < 10).select('a).analyze,
+      correlated = false)
     comparePlans(optimized, expected)
   }
 }

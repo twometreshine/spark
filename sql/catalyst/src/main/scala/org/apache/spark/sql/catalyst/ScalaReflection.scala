@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.catalyst
 
+import javax.lang.model.SourceVersion
+
 import org.apache.commons.lang3.reflect.ConstructorUtils
 
 import org.apache.spark.internal.Logging
@@ -72,7 +74,7 @@ object ScalaReflection extends ScalaReflection {
   /**
    * Synchronize to prevent concurrent usage of `<:<` operator.
    * This operator is not thread safe in any current version of scala; i.e.
-   * (2.11.12, 2.12.8, 2.13.0-M5).
+   * (2.11.12, 2.12.10, 2.13.0-M5).
    *
    * See https://github.com/scala/bug/issues/10766
    */
@@ -124,10 +126,13 @@ object ScalaReflection extends ScalaReflection {
       case t if isSubtype(t, definitions.ShortTpe) => classOf[Array[Short]]
       case t if isSubtype(t, definitions.ByteTpe) => classOf[Array[Byte]]
       case t if isSubtype(t, definitions.BooleanTpe) => classOf[Array[Boolean]]
+      case t if isSubtype(t, localTypeOf[Array[Byte]]) => classOf[Array[Array[Byte]]]
+      case t if isSubtype(t, localTypeOf[CalendarInterval]) => classOf[Array[CalendarInterval]]
+      case t if isSubtype(t, localTypeOf[Decimal]) => classOf[Array[Decimal]]
       case other =>
         // There is probably a better way to do this, but I couldn't find it...
         val elementType = dataTypeFor(other).asInstanceOf[ObjectType].cls
-        java.lang.reflect.Array.newInstance(elementType, 1).getClass
+        java.lang.reflect.Array.newInstance(elementType, 0).getClass
 
     }
     ObjectType(cls)
@@ -227,8 +232,19 @@ object ScalaReflection extends ScalaReflection {
       case t if isSubtype(t, localTypeOf[java.time.Instant]) =>
         createDeserializerForInstant(path)
 
+      case t if isSubtype(t, localTypeOf[java.lang.Enum[_]]) =>
+        createDeserializerForTypesSupportValueOf(
+          Invoke(path, "toString", ObjectType(classOf[String]), returnNullable = false),
+          getClassFromType(t))
+
       case t if isSubtype(t, localTypeOf[java.sql.Timestamp]) =>
         createDeserializerForSqlTimestamp(path)
+
+      case t if isSubtype(t, localTypeOf[java.time.Duration]) =>
+        createDeserializerForDuration(path)
+
+      case t if isSubtype(t, localTypeOf[java.time.Period]) =>
+        createDeserializerForPeriod(path)
 
       case t if isSubtype(t, localTypeOf[java.lang.String]) =>
         createDeserializerForString(path, returnNullable = false)
@@ -279,7 +295,7 @@ object ScalaReflection extends ScalaReflection {
 
       // We serialize a `Set` to Catalyst array. When we deserialize a Catalyst array
       // to a `Set`, if there are duplicated elements, the elements will be de-duplicated.
-      case t if isSubtype(t, localTypeOf[Seq[_]]) ||
+      case t if isSubtype(t, localTypeOf[scala.collection.Seq[_]]) ||
           isSubtype(t, localTypeOf[scala.collection.Set[_]]) =>
         val TypeRef(_, _, Seq(elementType)) = t
         val Schema(dataType, elementNullable) = schemaFor(elementType)
@@ -372,6 +388,23 @@ object ScalaReflection extends ScalaReflection {
           expressions.Literal.create(null, ObjectType(cls)),
           newInstance
         )
+
+      case t if isSubtype(t, localTypeOf[Enumeration#Value]) =>
+        // package example
+        // object Foo extends Enumeration {
+        //  type Foo = Value
+        //  val E1, E2 = Value
+        // }
+        // the fullName of tpe is example.Foo.Foo, but we need example.Foo so that
+        // we can call example.Foo.withName to deserialize string to enumeration.
+        val parent = t.asInstanceOf[TypeRef].pre.typeSymbol.asClass
+        val cls = mirror.runtimeClass(parent)
+        StaticInvoke(
+          cls,
+          ObjectType(getClassFromType(t)),
+          "withName",
+          createDeserializerForString(path, false) :: Nil,
+          returnNullable = false)
     }
   }
 
@@ -443,10 +476,9 @@ object ScalaReflection extends ScalaReflection {
       // Since List[_] also belongs to localTypeOf[Product], we put this case before
       // "case t if definedByConstructorParams(t)" to make sure it will match to the
       // case "localTypeOf[Seq[_]]"
-      case t if isSubtype(t, localTypeOf[Seq[_]]) =>
+      case t if isSubtype(t, localTypeOf[scala.collection.Seq[_]]) =>
         val TypeRef(_, _, Seq(elementType)) = t
         toCatalystArray(inputObject, elementType)
-
       case t if isSubtype(t, localTypeOf[Array[_]]) =>
         val TypeRef(_, _, Seq(elementType)) = t
         toCatalystArray(inputObject, elementType)
@@ -496,6 +528,12 @@ object ScalaReflection extends ScalaReflection {
 
       case t if isSubtype(t, localTypeOf[java.sql.Date]) => createSerializerForSqlDate(inputObject)
 
+      case t if isSubtype(t, localTypeOf[java.time.Duration]) =>
+        createSerializerForJavaDuration(inputObject)
+
+      case t if isSubtype(t, localTypeOf[java.time.Period]) =>
+        createSerializerForJavaPeriod(inputObject)
+
       case t if isSubtype(t, localTypeOf[BigDecimal]) =>
         createSerializerForScalaBigDecimal(inputObject)
 
@@ -504,6 +542,9 @@ object ScalaReflection extends ScalaReflection {
 
       case t if isSubtype(t, localTypeOf[java.math.BigInteger]) =>
         createSerializerForJavaBigInteger(inputObject)
+
+      case t if isSubtype(t, localTypeOf[java.lang.Enum[_]]) =>
+        createSerializerForJavaEnum(inputObject)
 
       case t if isSubtype(t, localTypeOf[scala.math.BigInt]) =>
         createSerializerForScalaBigInt(inputObject)
@@ -539,9 +580,10 @@ object ScalaReflection extends ScalaReflection {
 
         val params = getConstructorParameters(t)
         val fields = params.map { case (fieldName, fieldType) =>
-          if (javaKeywords.contains(fieldName)) {
-            throw new UnsupportedOperationException(s"`$fieldName` is a reserved keyword and " +
-              "cannot be used as field name\n" + walkedTypePath)
+          if (SourceVersion.isKeyword(fieldName) ||
+              !SourceVersion.isIdentifier(encodeFieldNameToIdentifier(fieldName))) {
+            throw new UnsupportedOperationException(s"`$fieldName` is not a valid identifier of " +
+              "Java and cannot be used as field name\n" + walkedTypePath)
           }
 
           // SPARK-26730 inputObject won't be null with If's guard below. And KnownNotNul
@@ -555,6 +597,14 @@ object ScalaReflection extends ScalaReflection {
           (fieldName, serializerFor(fieldValue, fieldType, newPath, seenTypeSet + t))
         }
         createSerializerForObject(inputObject, fields)
+
+      case t if isSubtype(t, localTypeOf[Enumeration#Value]) =>
+        createSerializerForString(
+          Invoke(
+            inputObject,
+            "toString",
+            ObjectType(classOf[java.lang.String]),
+            returnNullable = false))
 
       case _ =>
         throw new UnsupportedOperationException(
@@ -611,10 +661,39 @@ object ScalaReflection extends ScalaReflection {
     }
   }
 
+  private def erasure(tpe: Type): Type = {
+    // For user-defined AnyVal classes, we should not erasure it. Otherwise, it will
+    // resolve to underlying type which wrapped by this class, e.g erasure
+    // `case class Foo(i: Int) extends AnyVal` will return type `Int` instead of `Foo`.
+    // But, for other types, we do need to erasure it. For example, we need to erasure
+    // `scala.Any` to `java.lang.Object` in order to load it from Java ClassLoader.
+    // Please see SPARK-17368 & SPARK-31190 for more details.
+    if (isSubtype(tpe, localTypeOf[AnyVal]) && !tpe.toString.startsWith("scala")) {
+      tpe
+    } else {
+      tpe.erasure
+    }
+  }
+
+  /**
+   * Returns the full class name for a type. The returned name is the canonical
+   * Scala name, where each component is separated by a period. It is NOT the
+   * Java-equivalent runtime name (no dollar signs).
+   *
+   * In simple cases, both the Scala and Java names are the same, however when Scala
+   * generates constructs that do not map to a Java equivalent, such as singleton objects
+   * or nested classes in package objects, it uses the dollar sign ($) to create
+   * synthetic classes, emulating behaviour in Java bytecode.
+   */
+  def getClassNameFromType(tpe: `Type`): String = {
+    erasure(tpe).dealias.typeSymbol.asClass.fullName
+  }
+
   /*
    * Retrieves the runtime class corresponding to the provided type.
    */
-  def getClassFromType(tpe: Type): Class[_] = mirror.runtimeClass(tpe.dealias.typeSymbol.asClass)
+  def getClassFromType(tpe: Type): Class[_] =
+    mirror.runtimeClass(erasure(tpe).dealias.typeSymbol.asClass)
 
   case class Schema(dataType: DataType, nullable: Boolean)
 
@@ -651,7 +730,7 @@ object ScalaReflection extends ScalaReflection {
         val TypeRef(_, _, Seq(elementType)) = t
         val Schema(dataType, nullable) = schemaFor(elementType)
         Schema(ArrayType(dataType, containsNull = nullable), nullable = true)
-      case t if isSubtype(t, localTypeOf[Seq[_]]) =>
+      case t if isSubtype(t, localTypeOf[scala.collection.Seq[_]]) =>
         val TypeRef(_, _, Seq(elementType)) = t
         val Schema(dataType, nullable) = schemaFor(elementType)
         Schema(ArrayType(dataType, containsNull = nullable), nullable = true)
@@ -671,6 +750,12 @@ object ScalaReflection extends ScalaReflection {
         Schema(TimestampType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.time.LocalDate]) => Schema(DateType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.sql.Date]) => Schema(DateType, nullable = true)
+      case t if isSubtype(t, localTypeOf[CalendarInterval]) =>
+        Schema(CalendarIntervalType, nullable = true)
+      case t if isSubtype(t, localTypeOf[java.time.Duration]) =>
+        Schema(DayTimeIntervalType, nullable = true)
+      case t if isSubtype(t, localTypeOf[java.time.Period]) =>
+        Schema(YearMonthIntervalType, nullable = true)
       case t if isSubtype(t, localTypeOf[BigDecimal]) =>
         Schema(DecimalType.SYSTEM_DEFAULT, nullable = true)
       case t if isSubtype(t, localTypeOf[java.math.BigDecimal]) =>
@@ -688,6 +773,7 @@ object ScalaReflection extends ScalaReflection {
       case t if isSubtype(t, localTypeOf[java.lang.Short]) => Schema(ShortType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.lang.Byte]) => Schema(ByteType, nullable = true)
       case t if isSubtype(t, localTypeOf[java.lang.Boolean]) => Schema(BooleanType, nullable = true)
+      case t if isSubtype(t, localTypeOf[java.lang.Enum[_]]) => Schema(StringType, nullable = true)
       case t if isSubtype(t, definitions.IntTpe) => Schema(IntegerType, nullable = false)
       case t if isSubtype(t, definitions.LongTpe) => Schema(LongType, nullable = false)
       case t if isSubtype(t, definitions.DoubleTpe) => Schema(DoubleType, nullable = false)
@@ -702,6 +788,8 @@ object ScalaReflection extends ScalaReflection {
             val Schema(dataType, nullable) = schemaFor(fieldType)
             StructField(fieldName, dataType, nullable)
           }), nullable = true)
+      case t if isSubtype(t, localTypeOf[Enumeration#Value]) =>
+        Schema(StringType, nullable = true)
       case other =>
         throw new UnsupportedOperationException(s"Schema for type $other is not supported")
     }
@@ -753,13 +841,6 @@ object ScalaReflection extends ScalaReflection {
     }
   }
 
-  private val javaKeywords = Set("abstract", "assert", "boolean", "break", "byte", "case", "catch",
-    "char", "class", "const", "continue", "default", "do", "double", "else", "extends", "false",
-    "final", "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
-    "interface", "long", "native", "new", "null", "package", "private", "protected", "public",
-    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this", "throw",
-    "throws", "transient", "true", "try", "void", "volatile", "while")
-
   val typeJavaMapping = Map[DataType, Class[_]](
     BooleanType -> classOf[Boolean],
     ByteType -> classOf[Byte],
@@ -772,7 +853,9 @@ object ScalaReflection extends ScalaReflection {
     DateType -> classOf[DateType.InternalType],
     TimestampType -> classOf[TimestampType.InternalType],
     BinaryType -> classOf[BinaryType.InternalType],
-    CalendarIntervalType -> classOf[CalendarInterval]
+    CalendarIntervalType -> classOf[CalendarInterval],
+    DayTimeIntervalType -> classOf[DayTimeIntervalType.InternalType],
+    YearMonthIntervalType -> classOf[YearMonthIntervalType.InternalType]
   )
 
   val typeBoxedJavaMapping = Map[DataType, Class[_]](
@@ -784,7 +867,9 @@ object ScalaReflection extends ScalaReflection {
     FloatType -> classOf[java.lang.Float],
     DoubleType -> classOf[java.lang.Double],
     DateType -> classOf[java.lang.Integer],
-    TimestampType -> classOf[java.lang.Long]
+    TimestampType -> classOf[java.lang.Long],
+    DayTimeIntervalType -> classOf[java.lang.Long],
+    YearMonthIntervalType -> classOf[java.lang.Integer]
   )
 
   def dataTypeJavaClass(dt: DataType): Class[_] = {
@@ -818,6 +903,10 @@ object ScalaReflection extends ScalaReflection {
       Seq.empty
     }
   }
+
+  def encodeFieldNameToIdentifier(fieldName: String): String = {
+    TermName(fieldName).encodedName.toString
+  }
 }
 
 /**
@@ -832,10 +921,6 @@ trait ScalaReflection extends Logging {
   def mirror: universe.Mirror
 
   import universe._
-
-  // The Predef.Map is scala.collection.immutable.Map.
-  // Since the map values can be mutable, we explicitly import scala.collection.Map at here.
-  import scala.collection.Map
 
   /**
    * Any codes calling `scala.reflect.api.Types.TypeApi.<:<` should be wrapped by this method to
@@ -861,20 +946,6 @@ trait ScalaReflection extends Logging {
   def localTypeOf[T: TypeTag]: `Type` = {
     val tag = implicitly[TypeTag[T]]
     tag.in(mirror).tpe.dealias
-  }
-
-  /**
-   * Returns the full class name for a type. The returned name is the canonical
-   * Scala name, where each component is separated by a period. It is NOT the
-   * Java-equivalent runtime name (no dollar signs).
-   *
-   * In simple cases, both the Scala and Java names are the same, however when Scala
-   * generates constructs that do not map to a Java equivalent, such as singleton objects
-   * or nested classes in package objects, it uses the dollar sign ($) to create
-   * synthetic classes, emulating behaviour in Java bytecode.
-   */
-  def getClassNameFromType(tpe: `Type`): String = {
-    tpe.dealias.erasure.typeSymbol.asClass.fullName
   }
 
   /**
@@ -906,7 +977,18 @@ trait ScalaReflection extends Logging {
    * only defines a constructor via `apply` method.
    */
   private def getCompanionConstructor(tpe: Type): Symbol = {
-    tpe.typeSymbol.asClass.companion.asTerm.typeSignature.member(universe.TermName("apply"))
+    def throwUnsupportedOperation = {
+      throw new UnsupportedOperationException(s"Unable to find constructor for $tpe. " +
+        s"This could happen if $tpe is an interface, or a trait without companion object " +
+        "constructor.")
+    }
+    tpe.typeSymbol.asClass.companion match {
+      case NoSymbol => throwUnsupportedOperation
+      case sym => sym.asTerm.typeSignature.member(universe.TermName("apply")) match {
+        case NoSymbol => throwUnsupportedOperation
+        case constructorSym => constructorSym
+      }
+    }
   }
 
   protected def constructParams(tpe: Type): Seq[Symbol] = {

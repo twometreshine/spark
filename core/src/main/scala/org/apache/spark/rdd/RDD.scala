@@ -23,6 +23,7 @@ import scala.collection.{mutable, Map}
 import scala.collection.mutable.ArrayBuffer
 import scala.io.Codec
 import scala.language.implicitConversions
+import scala.ref.WeakReference
 import scala.reflect.{classTag, ClassTag}
 import scala.util.hashing
 
@@ -42,6 +43,7 @@ import org.apache.spark.partial.BoundedDouble
 import org.apache.spark.partial.CountEvaluator
 import org.apache.spark.partial.GroupedCountEvaluator
 import org.apache.spark.partial.PartialResult
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 import org.apache.spark.util.{BoundedPriorityQueue, Utils}
 import org.apache.spark.util.collection.{ExternalAppendOnlyMap, OpenHashMap,
@@ -225,10 +227,27 @@ abstract class RDD[T: ClassTag](
   /** Get the RDD's current storage level, or StorageLevel.NONE if none is set. */
   def getStorageLevel: StorageLevel = storageLevel
 
+  /**
+   * Lock for all mutable state of this RDD (persistence, partitions, dependencies, etc.).  We do
+   * not use `this` because RDDs are user-visible, so users might have added their own locking on
+   * RDDs; sharing that could lead to a deadlock.
+   *
+   * One thread might hold the lock on many of these, for a chain of RDD dependencies; but
+   * because DAGs are acyclic, and we only ever hold locks for one path in that DAG, there is no
+   * chance of deadlock.
+   *
+   * Executors may reference the shared fields (though they should never mutate them,
+   * that only happens on the driver).
+   */
+  private val stateLock = new Serializable {}
+
   // Our dependencies and partitions will be gotten by calling subclass's methods below, and will
   // be overwritten when we're checkpointed
-  private var dependencies_ : Seq[Dependency[_]] = _
-  @transient private var partitions_ : Array[Partition] = _
+  @volatile private var dependencies_ : Seq[Dependency[_]] = _
+  // When we overwrite the dependencies we keep a weak reference to the old dependencies
+  // for user controlled cleanup.
+  @volatile @transient private var legacyDependencies: WeakReference[Seq[Dependency[_]]] = _
+  @volatile @transient private var partitions_ : Array[Partition] = _
 
   /** An Option holding our checkpoint RDD, if we are checkpointed */
   private def checkpointRDD: Option[CheckpointRDD[T]] = checkpointData.flatMap(_.checkpointRDD)
@@ -240,9 +259,32 @@ abstract class RDD[T: ClassTag](
   final def dependencies: Seq[Dependency[_]] = {
     checkpointRDD.map(r => List(new OneToOneDependency(r))).getOrElse {
       if (dependencies_ == null) {
-        dependencies_ = getDependencies
+        stateLock.synchronized {
+          if (dependencies_ == null) {
+            dependencies_ = getDependencies
+          }
+        }
       }
       dependencies_
+    }
+  }
+
+  /**
+   * Get the list of dependencies of this RDD ignoring checkpointing.
+   */
+  final private def internalDependencies: Option[Seq[Dependency[_]]] = {
+    if (legacyDependencies != null) {
+      legacyDependencies.get
+    } else if (dependencies_ != null) {
+      Some(dependencies_)
+    } else {
+      // This case should be infrequent.
+      stateLock.synchronized {
+        if (dependencies_ == null) {
+          dependencies_ = getDependencies
+        }
+        Some(dependencies_)
+      }
     }
   }
 
@@ -253,10 +295,14 @@ abstract class RDD[T: ClassTag](
   final def partitions: Array[Partition] = {
     checkpointRDD.map(_.partitions).getOrElse {
       if (partitions_ == null) {
-        partitions_ = getPartitions
-        partitions_.zipWithIndex.foreach { case (partition, index) =>
-          require(partition.index == index,
-            s"partitions($index).partition == ${partition.index}, but it should equal $index")
+        stateLock.synchronized {
+          if (partitions_ == null) {
+            partitions_ = getPartitions
+            partitions_.zipWithIndex.foreach { case (partition, index) =>
+              require(partition.index == index,
+                s"partitions($index).partition == ${partition.index}, but it should equal $index")
+            }
+          }
         }
       }
       partitions_
@@ -281,7 +327,7 @@ abstract class RDD[T: ClassTag](
 
   /**
    * Internal method to this RDD; will read from cache if applicable, or otherwise compute it.
-   * This should ''not'' be called by users directly, but is available for implementors of custom
+   * This should ''not'' be called by users directly, but is available for implementers of custom
    * subclasses of RDD.
    */
   final def iterator(split: Partition, context: TaskContext): Iterator[T] = {
@@ -339,6 +385,7 @@ abstract class RDD[T: ClassTag](
       readCachedBlock = false
       computeOrReadCheckpoint(partition, context)
     }) match {
+      // Block hit.
       case Left(blockResult) =>
         if (readCachedBlock) {
           val existingMetrics = context.taskMetrics().inputMetrics
@@ -352,6 +399,7 @@ abstract class RDD[T: ClassTag](
         } else {
           new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
         }
+      // Need to compute the block.
       case Right(iter) =>
         new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
     }
@@ -430,8 +478,6 @@ abstract class RDD[T: ClassTag](
    *
    * If you are decreasing the number of partitions in this RDD, consider using `coalesce`,
    * which can avoid performing a shuffle.
-   *
-   * TODO Fix the Shuffle+Repartition data loss issue described in SPARK-23207.
    */
   def repartition(numPartitions: Int)(implicit ord: Ordering[T] = null): RDD[T] = withScope {
     coalesce(numPartitions, shuffle = true)
@@ -557,7 +603,7 @@ abstract class RDD[T: ClassTag](
       val sampler = new BernoulliCellSampler[T](lb, ub)
       sampler.setSeed(seed + index)
       sampler.sample(partition)
-    }, preservesPartitioning = true)
+    }, isOrderSensitive = true, preservesPartitioning = true)
   }
 
   /**
@@ -868,6 +914,29 @@ abstract class RDD[T: ClassTag](
       this,
       (_: TaskContext, index: Int, iter: Iterator[T]) => cleanedF(index, iter),
       preservesPartitioning)
+  }
+
+  /**
+   * Return a new RDD by applying a function to each partition of this RDD, while tracking the index
+   * of the original partition.
+   *
+   * `preservesPartitioning` indicates whether the input function preserves the partitioner, which
+   * should be `false` unless this is a pair RDD and the input function doesn't modify the keys.
+   *
+   * `isOrderSensitive` indicates whether the function is order-sensitive. If it is order
+   * sensitive, it may return totally different result when the input order
+   * is changed. Mostly stateful functions are order-sensitive.
+   */
+  private[spark] def mapPartitionsWithIndex[U: ClassTag](
+      f: (Int, Iterator[T]) => Iterator[U],
+      preservesPartitioning: Boolean,
+      isOrderSensitive: Boolean): RDD[U] = withScope {
+    val cleanedF = sc.clean(f)
+    new MapPartitionsRDD(
+      this,
+      (_: TaskContext, index: Int, iter: Iterator[T]) => cleanedF(index, iter),
+      preservesPartitioning,
+      isOrderSensitive = isOrderSensitive)
   }
 
   /**
@@ -1657,6 +1726,40 @@ abstract class RDD[T: ClassTag](
 
   /**
    * :: Experimental ::
+   * Removes an RDD's shuffles and it's non-persisted ancestors.
+   * When running without a shuffle service, cleaning up shuffle files enables downscaling.
+   * If you use the RDD after this call, you should checkpoint and materialize it first.
+   * If you are uncertain of what you are doing, please do not use this feature.
+   * Additional techniques for mitigating orphaned shuffle files:
+   *   * Tuning the driver GC to be more aggressive, so the regular context cleaner is triggered
+   *   * Setting an appropriate TTL for shuffle files to be auto cleaned
+   */
+  @Experimental
+  @DeveloperApi
+  @Since("3.1.0")
+  def cleanShuffleDependencies(blocking: Boolean = false): Unit = {
+    sc.cleaner.foreach { cleaner =>
+      /**
+       * Clean the shuffles & all of its parents.
+       */
+      def cleanEagerly(dep: Dependency[_]): Unit = {
+        if (dep.isInstanceOf[ShuffleDependency[_, _, _]]) {
+          val shuffleId = dep.asInstanceOf[ShuffleDependency[_, _, _]].shuffleId
+          cleaner.doCleanupShuffle(shuffleId, blocking)
+        }
+        val rdd = dep.rdd
+        val rddDepsOpt = rdd.internalDependencies
+        if (rdd.getStorageLevel == StorageLevel.NONE) {
+          rddDepsOpt.foreach(deps => deps.foreach(cleanEagerly))
+        }
+      }
+      internalDependencies.foreach(deps => deps.foreach(cleanEagerly))
+    }
+  }
+
+
+  /**
+   * :: Experimental ::
    * Marks the current stage as a barrier stage, where Spark must launch all tasks together.
    * In case of a task failure, instead of only restarting the failed task, Spark will abort the
    * entire stage and re-launch all tasks for this stage.
@@ -1671,11 +1774,35 @@ abstract class RDD[T: ClassTag](
   @Since("2.4.0")
   def barrier(): RDDBarrier[T] = withScope(new RDDBarrier[T](this))
 
+  /**
+   * Specify a ResourceProfile to use when calculating this RDD. This is only supported on
+   * certain cluster managers and currently requires dynamic allocation to be enabled.
+   * It will result in new executors with the resources specified being acquired to
+   * calculate the RDD.
+   */
+  @Experimental
+  @Since("3.1.0")
+  def withResources(rp: ResourceProfile): this.type = {
+    resourceProfile = Option(rp)
+    sc.resourceProfileManager.addResourceProfile(resourceProfile.get)
+    this
+  }
+
+  /**
+   * Get the ResourceProfile specified with this RDD or null if it wasn't specified.
+   * @return the user specified ResourceProfile or null (for Java compatibility) if
+   *         none was specified
+   */
+  @Experimental
+  @Since("3.1.0")
+  def getResourceProfile(): ResourceProfile = resourceProfile.getOrElse(null)
+
   // =======================================================================
   // Other internal methods and fields
   // =======================================================================
 
   private var storageLevel: StorageLevel = StorageLevel.NONE
+  @transient private var resourceProfile: Option[ResourceProfile] = None
 
   /** User code that created this RDD (e.g. `textFile`, `parallelize`). */
   @transient private[spark] val creationSite = sc.getCallSite()
@@ -1767,7 +1894,8 @@ abstract class RDD[T: ClassTag](
    * Changes the dependencies of this RDD from its original parents to a new RDD (`newRDD`)
    * created from the checkpoint file, and forget its old dependencies and partitions.
    */
-  private[spark] def markCheckpointed(): Unit = {
+  private[spark] def markCheckpointed(): Unit = stateLock.synchronized {
+    legacyDependencies = new WeakReference(dependencies_)
     clearDependencies()
     partitions_ = null
     deps = null    // Forget the constructor argument for dependencies too
@@ -1779,7 +1907,7 @@ abstract class RDD[T: ClassTag](
    * collected. Subclasses of RDD may override this method for implementing their own cleaning
    * logic. See [[org.apache.spark.rdd.UnionRDD]] for an example.
    */
-  protected def clearDependencies(): Unit = {
+  protected def clearDependencies(): Unit = stateLock.synchronized {
     dependencies_ = null
   }
 
@@ -1791,9 +1919,8 @@ abstract class RDD[T: ClassTag](
 
       val persistence = if (storageLevel != StorageLevel.NONE) storageLevel.description else ""
       val storageInfo = rdd.context.getRDDStorageInfo(_.id == rdd.id).map(info =>
-        "    CachedPartitions: %d; MemorySize: %s; ExternalBlockStoreSize: %s; DiskSize: %s".format(
-          info.numCachedPartitions, bytesToString(info.memSize),
-          bytesToString(info.externalBlockStoreSize), bytesToString(info.diskSize)))
+        "    CachedPartitions: %d; MemorySize: %s; DiskSize: %s".format(
+          info.numCachedPartitions, bytesToString(info.memSize), bytesToString(info.diskSize)))
 
       s"$rdd [$persistence]" +: storageInfo
     }
@@ -1882,6 +2009,9 @@ abstract class RDD[T: ClassTag](
   @transient protected lazy val isBarrier_ : Boolean =
     dependencies.filter(!_.isInstanceOf[ShuffleDependency[_, _, _]]).exists(_.rdd.isBarrier())
 
+  private final lazy val _outputDeterministicLevel: DeterministicLevel.Value =
+    getOutputDeterministicLevel
+
   /**
    * Returns the deterministic level of this RDD's output. Please refer to [[DeterministicLevel]]
    * for the definition.
@@ -1892,14 +2022,14 @@ abstract class RDD[T: ClassTag](
    * candidate that is deterministic least. Please override [[getOutputDeterministicLevel]] to
    * provide custom logic of calculating output deterministic level.
    */
-  // TODO: make it public so users can set deterministic level to their custom RDDs.
+  // TODO(SPARK-34612): make it public so users can set deterministic level to their custom RDDs.
   // TODO: this can be per-partition. e.g. UnionRDD can have different deterministic level for
   // different partitions.
-  private[spark] final lazy val outputDeterministicLevel: DeterministicLevel.Value = {
+  private[spark] final def outputDeterministicLevel: DeterministicLevel.Value = {
     if (isReliablyCheckpointed) {
       DeterministicLevel.DETERMINATE
     } else {
-      getOutputDeterministicLevel
+      _outputDeterministicLevel
     }
   }
 
@@ -1938,6 +2068,7 @@ abstract class RDD[T: ClassTag](
       deterministicLevelCandidates.maxBy(_.id)
     }
   }
+
 }
 
 

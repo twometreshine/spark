@@ -17,28 +17,36 @@
 
 package org.apache.spark.shuffle.sort
 
+import org.mockito.{Mock, MockitoAnnotations}
+import org.mockito.Answers.RETURNS_SMART_NULLS
 import org.mockito.Mockito._
-import org.mockito.MockitoAnnotations
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
 
 import org.apache.spark.{Partitioner, SharedSparkContext, ShuffleDependency, SparkFunSuite}
 import org.apache.spark.memory.MemoryTestingUtils
 import org.apache.spark.serializer.JavaSerializer
 import org.apache.spark.shuffle.{BaseShuffleHandle, IndexShuffleBlockResolver}
+import org.apache.spark.shuffle.api.ShuffleExecutorComponents
+import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
+import org.apache.spark.storage.BlockManager
 import org.apache.spark.util.Utils
 
 
 class SortShuffleWriterSuite extends SparkFunSuite with SharedSparkContext with Matchers {
+
+  @Mock(answer = RETURNS_SMART_NULLS)
+  private var blockManager: BlockManager = _
 
   private val shuffleId = 0
   private val numMaps = 5
   private var shuffleHandle: BaseShuffleHandle[Int, Int, Int] = _
   private val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
   private val serializer = new JavaSerializer(conf)
+  private var shuffleExecutorComponents: ShuffleExecutorComponents = _
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    MockitoAnnotations.initMocks(this)
+    MockitoAnnotations.openMocks(this).close()
     val partitioner = new Partitioner() {
       def numPartitions = numMaps
       def getPartition(key: Any) = Utils.nonNegativeMod(key.hashCode, numPartitions)
@@ -49,8 +57,10 @@ class SortShuffleWriterSuite extends SparkFunSuite with SharedSparkContext with 
       when(dependency.serializer).thenReturn(serializer)
       when(dependency.aggregator).thenReturn(None)
       when(dependency.keyOrdering).thenReturn(None)
-      new BaseShuffleHandle(shuffleId, numMaps = numMaps, dependency)
+      new BaseShuffleHandle(shuffleId, dependency)
     }
+    shuffleExecutorComponents = new LocalDiskShuffleExecutorComponents(
+      conf, blockManager, shuffleBlockResolver)
   }
 
   override def afterAll(): Unit = {
@@ -64,10 +74,10 @@ class SortShuffleWriterSuite extends SparkFunSuite with SharedSparkContext with 
   test("write empty iterator") {
     val context = MemoryTestingUtils.fakeTaskContext(sc.env)
     val writer = new SortShuffleWriter[Int, Int, Int](
-      shuffleBlockResolver,
       shuffleHandle,
       mapId = 1,
-      context)
+      context,
+      shuffleExecutorComponents)
     writer.write(Iterator.empty)
     writer.stop(success = true)
     val dataFile = shuffleBlockResolver.getDataFile(shuffleId, 1)
@@ -81,10 +91,10 @@ class SortShuffleWriterSuite extends SparkFunSuite with SharedSparkContext with 
     val context = MemoryTestingUtils.fakeTaskContext(sc.env)
     val records = List[(Int, Int)]((1, 2), (2, 3), (4, 4), (6, 5))
     val writer = new SortShuffleWriter[Int, Int, Int](
-      shuffleBlockResolver,
       shuffleHandle,
       mapId = 2,
-      context)
+      context,
+      shuffleExecutorComponents)
     writer.write(records.toIterator)
     writer.stop(success = true)
     val dataFile = shuffleBlockResolver.getDataFile(shuffleId, 2)

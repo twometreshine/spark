@@ -19,13 +19,13 @@ package org.apache.spark.sql.hive
 
 import java.io.File
 
+import com.google.common.io.Files
 import org.apache.hadoop.fs.Path
 import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.{QueryTest, _}
 import org.apache.spark.sql.catalyst.parser.ParseException
-import org.apache.spark.sql.catalyst.plans.logical.InsertIntoTable
 import org.apache.spark.sql.hive.execution.InsertIntoHiveTable
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
@@ -35,7 +35,7 @@ import org.apache.spark.util.Utils
 
 case class TestData(key: Int, value: String)
 
-case class ThreeCloumntable(key: Int, value: String, key1: String)
+case class ThreeColumnTable(key: Int, value: String, key1: String)
 
 class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
     with SQLTestUtils  with PrivateMethodTester  {
@@ -277,7 +277,8 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
   test("Test partition mode = strict") {
     withSQLConf(("hive.exec.dynamic.partition.mode", "strict")) {
       withTable("partitioned") {
-        sql("CREATE TABLE partitioned (id bigint, data string) PARTITIONED BY (part string)")
+        sql("CREATE TABLE partitioned (id bigint, data string) USING hive " +
+          "PARTITIONED BY (part string)")
         val data = (1 to 10).map(i => (i, s"data-$i", if ((i % 2) == 0) "even" else "odd"))
           .toDF("id", "data", "part")
 
@@ -462,7 +463,7 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
         // Columns `c + 1` and `d + 1` are resolved by position, and thus mapped to partition
         // columns `b` and `c` of the target table.
         val df = Seq((1, 2, 3, 4)).toDF("a", "b", "c", "d")
-        df.select('a + 1, 'b + 1, 'c + 1, 'd + 1).write.insertInto(tableName)
+        df.select($"a" + 1, $"b" + 1, $"c" + 1, $"d" + 1).write.insertInto(tableName)
 
         checkAnswer(
           sql(s"SELECT a, b, c, d FROM $tableName"),
@@ -556,7 +557,7 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
     val inputPath = new Path("/tmp/b/c")
     var stagingDir = "tmp/b"
     val saveHiveFile = InsertIntoHiveTable(null, Map.empty, null, false, false, null)
-    val getStagingDir = PrivateMethod[Path]('getStagingDir)
+    val getStagingDir = PrivateMethod[Path](Symbol("getStagingDir"))
     var path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
     assert(path.toString.indexOf("/tmp/b_hive_") != -1)
 
@@ -763,7 +764,7 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
       val path = dir.toURI.getPath
 
       val e = intercept[AnalysisException] {
-        sql(s"INSERT OVERWRITE LOCAL DIRECTORY '${path}' TABLE notexists")
+        sql(s"INSERT OVERWRITE LOCAL DIRECTORY '${path}' TABLE nonexistent")
       }.getMessage
       assert(e.contains("Table or view not found"))
     }
@@ -822,6 +823,51 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
           }
         }
       }
+    }
+  }
+
+  test("SPARK-30201 HiveOutputWriter standardOI should use ObjectInspectorCopyOption.DEFAULT") {
+    withTable("t1", "t2") {
+      withTempDir { dir =>
+        val file = new File(dir, "test.hex")
+        val hex = "AABBCC"
+        val bs = org.apache.commons.codec.binary.Hex.decodeHex(hex.toCharArray)
+        Files.write(bs, file)
+        val path = file.getParent
+        sql(s"create table t1 (c string) STORED AS TEXTFILE location '$path'")
+        checkAnswer(
+          sql("select hex(c) from t1"),
+          Row(hex)
+        )
+
+        sql("create table t2 as select c from t1")
+        checkAnswer(
+          sql("select hex(c) from t2"),
+          Row(hex)
+        )
+      }
+    }
+  }
+
+  test("SPARK-32508 " +
+    "Disallow empty part col values in partition spec before static partition writing") {
+    withTable("t1") {
+      spark.sql(
+        """
+          |CREATE TABLE t1 (c1 int)
+          |PARTITIONED BY (d string)
+          """.stripMargin)
+
+      val e = intercept[AnalysisException] {
+        spark.sql(
+          """
+            |INSERT OVERWRITE TABLE t1 PARTITION(d='')
+            |SELECT 1
+          """.stripMargin)
+      }.getMessage
+
+      assert(!e.contains("get partition: Value for key d is null or empty"))
+      assert(e.contains("Partition spec is invalid"))
     }
   }
 }

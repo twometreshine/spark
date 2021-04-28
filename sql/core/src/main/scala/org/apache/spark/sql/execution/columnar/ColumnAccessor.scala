@@ -23,9 +23,11 @@ import scala.annotation.tailrec
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{UnsafeArrayData, UnsafeMapData, UnsafeRow}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.columnar.compression.CompressibleColumnAccessor
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
  * An `Iterator` like trait used to extract values from columnar byte buffer. When a value is
@@ -36,7 +38,7 @@ import org.apache.spark.sql.types._
 private[columnar] trait ColumnAccessor {
   initialize()
 
-  protected def initialize()
+  protected def initialize(): Unit
 
   def hasNext: Boolean
 
@@ -50,7 +52,7 @@ private[columnar] abstract class BasicColumnAccessor[JvmType](
     protected val columnType: ColumnType[JvmType])
   extends ColumnAccessor {
 
-  protected def initialize() {}
+  protected def initialize(): Unit = {}
 
   override def hasNext: Boolean = buffer.hasRemaining
 
@@ -104,6 +106,10 @@ private[columnar] class BinaryColumnAccessor(buffer: ByteBuffer)
   extends BasicColumnAccessor[Array[Byte]](buffer, BINARY)
   with NullableColumnAccessor
 
+private[columnar] class IntervalColumnAccessor(buffer: ByteBuffer, dataType: CalendarIntervalType)
+  extends BasicColumnAccessor[CalendarInterval](buffer, CALENDAR_INTERVAL)
+  with NullableColumnAccessor
+
 private[columnar] class CompactDecimalColumnAccessor(buffer: ByteBuffer, dataType: DecimalType)
   extends NativeColumnAccessor(buffer, COMPACT_DECIMAL(dataType))
 
@@ -146,8 +152,7 @@ private[sql] object ColumnAccessor {
       case array: ArrayType => new ArrayColumnAccessor(buf, array)
       case map: MapType => new MapColumnAccessor(buf, map)
       case udt: UserDefinedType[_] => ColumnAccessor(udt.sqlType, buffer)
-      case other =>
-        throw new Exception(s"not support type: $other")
+      case other => throw QueryExecutionErrors.notSupportTypeError(other)
     }
   }
 
@@ -157,7 +162,7 @@ private[sql] object ColumnAccessor {
       val nativeAccessor = columnAccessor.asInstanceOf[NativeColumnAccessor[_]]
       nativeAccessor.decompress(columnVector, numRows)
     } else {
-      throw new RuntimeException("Not support non-primitive type now")
+      throw QueryExecutionErrors.notSupportNonPrimitiveTypeError()
     }
   }
 

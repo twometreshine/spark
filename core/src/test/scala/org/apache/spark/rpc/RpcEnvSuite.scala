@@ -33,10 +33,9 @@ import org.mockito.Mockito.{mock, never, verify, when}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually._
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkEnv, SparkException, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkEnv, SparkException, SparkFunSuite}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.config._
-import org.apache.spark.internal.config.Network
 import org.apache.spark.util.{ThreadUtils, Utils}
 
 /**
@@ -185,6 +184,48 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
       // controlling timeout property
       assert(e.isInstanceOf[RpcTimeoutException])
       assert(e.getMessage.contains(shortProp))
+    } finally {
+      anotherEnv.shutdown()
+      anotherEnv.awaitTermination()
+    }
+  }
+
+  test("ask a message abort") {
+    env.setupEndpoint("ask-abort", new RpcEndpoint {
+      override val rpcEnv = env
+
+      override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+        case msg: String =>
+          Thread.sleep(10000)
+          context.reply(msg)
+      }
+    })
+
+    val conf = new SparkConf()
+    val shortProp = "spark.rpc.short.timeout"
+    conf.set(Network.RPC_RETRY_WAIT, 0L)
+    conf.set(Network.RPC_NUM_RETRIES, 1)
+    val anotherEnv = createRpcEnv(conf, "remote", 0, clientMode = true)
+    // Use anotherEnv to find out the RpcEndpointRef
+    val rpcEndpointRef = anotherEnv.setupEndpointRef(env.address, "ask-abort")
+    try {
+      val e = intercept[SparkException] {
+        val timeout = new RpcTimeout(10.seconds, shortProp)
+        val abortableRpcFuture = rpcEndpointRef.askAbortable[String](
+          "hello", timeout)
+
+        new Thread {
+          override def run: Unit = {
+            Thread.sleep(100)
+            abortableRpcFuture.abort(new RuntimeException("TestAbort"))
+          }
+        }.start()
+
+        timeout.awaitResult(abortableRpcFuture.future)
+      }
+      // The SparkException cause should be a RuntimeException with "TestAbort" message
+      assert(e.getCause.isInstanceOf[RuntimeException])
+      assert(e.getCause.getMessage.contains("TestAbort"))
     } finally {
       anotherEnv.shutdown()
       anotherEnv.awaitTermination()
@@ -367,7 +408,7 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
 
       (0 until 10) foreach { _ =>
         new Thread {
-          override def run() {
+          override def run(): Unit = {
             (0 until 100) foreach { _ =>
               endpointRef.send("Hello")
             }
@@ -860,7 +901,6 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
           }
         }
 
-        val sm = new SecurityManager(conf)
         val hc = SparkHadoopUtil.get.conf
 
         val files = Seq(
@@ -872,7 +912,7 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
           (subFile2, dir2Uri + "/file2"))
         files.foreach { case (f, uri) =>
           val destFile = new File(destDir, f.getName())
-          Utils.fetchFile(uri, destDir, conf, sm, hc, 0L, false)
+          Utils.fetchFile(uri, destDir, conf, hc, 0L, false)
           assert(Files.equal(f, destFile))
         }
 
@@ -880,7 +920,7 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
         Seq("files", "jars", "dir1").foreach { root =>
           intercept[Exception] {
             val uri = env.address.toSparkURL + s"/$root/doesNotExist"
-            Utils.fetchFile(uri, destDir, conf, sm, hc, 0L, false)
+            Utils.fetchFile(uri, destDir, conf, hc, 0L, false)
           }
         }
       }
@@ -912,7 +952,43 @@ abstract class RpcEnvSuite extends SparkFunSuite with BeforeAndAfterAll {
     verify(endpoint, never()).onDisconnected(any())
     verify(endpoint, never()).onNetworkError(any(), any())
   }
+
+  test("isolated endpoints") {
+    val latch = new CountDownLatch(1)
+    val singleThreadedEnv = createRpcEnv(
+      new SparkConf().set(Network.RPC_NETTY_DISPATCHER_NUM_THREADS, 1), "singleThread", 0)
+    try {
+      val blockingEndpoint = singleThreadedEnv.setupEndpoint("blocking", new IsolatedRpcEndpoint {
+        override val rpcEnv: RpcEnv = singleThreadedEnv
+
+        override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case m =>
+            latch.await()
+            context.reply(m)
+        }
+      })
+
+      val nonBlockingEndpoint = singleThreadedEnv.setupEndpoint("non-blocking", new RpcEndpoint {
+        override val rpcEnv: RpcEnv = singleThreadedEnv
+
+        override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+          case m => context.reply(m)
+        }
+      })
+
+      val to = new RpcTimeout(5.seconds, "test-timeout")
+      val blockingFuture = blockingEndpoint.ask[String]("hi", to)
+      assert(nonBlockingEndpoint.askSync[String]("hello", to) === "hello")
+      latch.countDown()
+      assert(ThreadUtils.awaitResult(blockingFuture, 5.seconds) === "hi")
+    } finally {
+      latch.countDown()
+      singleThreadedEnv.shutdown()
+    }
+  }
 }
+
+case class Register(ref: RpcEndpointRef)
 
 class UnserializableClass
 

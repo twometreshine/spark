@@ -29,7 +29,7 @@ import org.apache.spark.annotation.Since
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.MAX_RESULT_SIZE
 import org.apache.spark.mllib.linalg._
-import org.apache.spark.mllib.stat.{MultivariateOnlineSummarizer, MultivariateStatisticalSummary}
+import org.apache.spark.mllib.stat._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.random.XORShiftRandom
@@ -433,11 +433,11 @@ class RowMatrix @Since("1.0.0") (
     val n = numCols().toInt
     checkNumColumns(n)
 
-    val summary = computeColumnSummaryStatistics()
+    val summary = Statistics.colStats(rows.map((_, 1.0)), Seq("count", "mean"))
     val m = summary.count
     require(m > 1, s"RowMatrix.computeCovariance called on matrix with only $m rows." +
       "  Cannot compute the covariance of a RowMatrix with <= 1 row.")
-    val mean = summary.mean
+    val mean = Vectors.fromML(summary.mean)
 
     if (rows.first().isInstanceOf[DenseVector]) {
       computeDenseVectorCovariance(mean, n, m)
@@ -616,7 +616,8 @@ class RowMatrix @Since("1.0.0") (
       10 * math.log(numCols()) / threshold
     }
 
-    columnSimilaritiesDIMSUM(computeColumnSummaryStatistics().normL2.toArray, gamma)
+    val summary = Statistics.colStats(rows.map((_, 1.0)), Seq("normL2"))
+    columnSimilaritiesDIMSUM(summary.normL2.toArray, gamma)
   }
 
   /**
@@ -692,11 +693,11 @@ class RowMatrix @Since("1.0.0") (
     val pBV = sc.broadcast(colMagsCorrected.map(c => sg / c))
     val qBV = sc.broadcast(colMagsCorrected.map(c => math.min(sg, c)))
 
-    val sims = rows.mapPartitionsWithIndex { (indx, iter) =>
+    val sims = rows.mapPartitionsWithIndex { (index, iter) =>
       val p = pBV.value
       val q = qBV.value
 
-      val rand = new XORShiftRandom(indx)
+      val rand = new XORShiftRandom(index)
       val scaled = new Array[Double](p.size)
       iter.flatMap { row =>
         row match {
@@ -747,6 +748,8 @@ class RowMatrix @Since("1.0.0") (
               }
               buf
             }.flatten
+          case v =>
+            throw new IllegalArgumentException(s"Unknown vector type ${v.getClass}.")
         }
       }
     }.reduceByKey(_ + _).map { case ((i, j), sim) =>
@@ -761,7 +764,7 @@ class RowMatrix @Since("1.0.0") (
     val mat = BDM.zeros[Double](m, n)
     var i = 0
     rows.collect().foreach { vector =>
-      vector.foreachActive { case (j, v) =>
+      vector.foreachNonZero { case (j, v) =>
         mat(i, j) = v
       }
       i += 1
@@ -770,7 +773,7 @@ class RowMatrix @Since("1.0.0") (
   }
 
   /** Updates or verifies the number of rows. */
-  private def updateNumRows(m: Long) {
+  private def updateNumRows(m: Long): Unit = {
     if (nRows <= 0) {
       nRows = m
     } else {
@@ -785,11 +788,15 @@ class RowMatrix @Since("1.0.0") (
    * Based on the formulae: (numPartitions)^(1/depth) * objectSize <= DriverMaxResultSize
    * @param aggregatedObjectSizeInBytes the size, in megabytes, of the object being tree aggregated
    */
-  private[spark] def getTreeAggregateIdealDepth(aggregatedObjectSizeInBytes: Long) = {
+  private[spark] def getTreeAggregateIdealDepth(aggregatedObjectSizeInBytes: Long): Int = {
     require(aggregatedObjectSizeInBytes > 0,
       "Cannot compute aggregate depth heuristic based on a zero-size object to aggregate")
 
     val maxDriverResultSizeInBytes = rows.conf.get[Long](MAX_RESULT_SIZE)
+    if (maxDriverResultSizeInBytes <= 0) {
+      // Unlimited result size, so 1 is OK
+      return 1
+    }
 
     require(maxDriverResultSizeInBytes > aggregatedObjectSizeInBytes,
       s"Cannot aggregate object of size $aggregatedObjectSizeInBytes Bytes, "

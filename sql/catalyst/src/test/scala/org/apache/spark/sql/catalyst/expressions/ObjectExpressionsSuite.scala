@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.expressions
 import java.sql.{Date, Timestamp}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable.WrappedArray
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.Random
@@ -27,7 +28,7 @@ import scala.util.Random
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.sql.{RandomDataGenerator, Row}
-import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, JavaTypeInference, ScalaReflection}
+import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.ScroogeLikeExample
 import org.apache.spark.sql.catalyst.analysis.{ResolveTimeZone, SimpleAnalyzer, UnresolvedDeserializer}
 import org.apache.spark.sql.catalyst.dsl.expressions._
@@ -35,11 +36,9 @@ import org.apache.spark.sql.catalyst.encoders._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.expressions.objects._
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Project}
-import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData}
-import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, DateTimeUtils, GenericArrayData, IntervalUtils}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.UTF8String
 
 class InvokeTargetClass extends Serializable {
   def filterInt(e: Any): Any = e.asInstanceOf[Int] > 0
@@ -157,10 +156,10 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         "fromPrimitiveArray", ObjectType(classOf[Array[Int]]),
         Array[Int](1, 2, 3), UnsafeArrayData.fromPrimitiveArray(Array[Int](1, 2, 3))),
       (DateTimeUtils.getClass, ObjectType(classOf[Date]),
-        "toJavaDate", ObjectType(classOf[DateTimeUtils.SQLDate]), 77777,
+        "toJavaDate", ObjectType(classOf[Int]), 77777,
         DateTimeUtils.toJavaDate(77777)),
       (DateTimeUtils.getClass, ObjectType(classOf[Timestamp]),
-        "toJavaTimestamp", ObjectType(classOf[DateTimeUtils.SQLTimestamp]),
+        "toJavaTimestamp", ObjectType(classOf[Long]),
         88888888.toLong, DateTimeUtils.toJavaTimestamp(88888888))
     ).foreach { case (cls, dataType, methodName, argType, arg, expected) =>
       checkObjectExprEvaluation(StaticInvoke(cls, dataType, methodName,
@@ -213,9 +212,9 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
     val initializeWithNonexistingMethod = InitializeJavaBean(
       Literal.fromObject(new java.util.LinkedList[Int]),
-      Map("nonexisting" -> Literal(1)))
+      Map("nonexistent" -> Literal(1)))
     checkExceptionInExpression[Exception](initializeWithNonexistingMethod,
-      """A method named "nonexisting" is not declared in any enclosing class """ +
+      """A method named "nonexistent" is not declared in any enclosing class """ +
         "nor any supertype")
 
     val initializeWithWrongParamType = InitializeJavaBean(
@@ -270,7 +269,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   private def checkObjectExprEvaluation(
       expression: => Expression, expected: Any, inputRow: InternalRow = EmptyRow): Unit = {
     val serializer = new JavaSerializer(new SparkConf()).newInstance
-    val resolver = ResolveTimeZone(new SQLConf)
+    val resolver = ResolveTimeZone
     val expr = resolver.resolveTimeZones(serializer.deserialize(serializer.serialize(expression)))
     checkEvaluationWithoutCodegen(expr, expected, inputRow)
     checkEvaluationWithMutableProjection(expr, expected, inputRow)
@@ -331,6 +330,8 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
           assert(result.asInstanceOf[ArrayData].array.toSeq == expected)
         case l if classOf[java.util.List[_]].isAssignableFrom(l) =>
           assert(result.asInstanceOf[java.util.List[_]].asScala == expected)
+        case a if classOf[WrappedArray[Int]].isAssignableFrom(a) =>
+          assert(result == WrappedArray.make[Int](expected.toArray))
         case s if classOf[Seq[_]].isAssignableFrom(s) =>
           assert(result.asInstanceOf[Seq[_]] == expected)
         case s if classOf[scala.collection.Set[_]].isAssignableFrom(s) =>
@@ -338,7 +339,8 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       }
     }
 
-    val customCollectionClasses = Seq(classOf[Seq[Int]], classOf[scala.collection.Set[Int]],
+    val customCollectionClasses = Seq(classOf[WrappedArray[Int]],
+      classOf[Seq[Int]], classOf[scala.collection.Set[Int]],
       classOf[java.util.List[Int]], classOf[java.util.AbstractList[Int]],
       classOf[java.util.AbstractSequentialList[Int]], classOf[java.util.Vector[Int]],
       classOf[java.util.Stack[Int]], null)
@@ -358,6 +360,7 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     stack.add(3)
 
     Seq(
+      (Seq(1, 2, 3), ObjectType(classOf[WrappedArray[Int]])),
       (Seq(1, 2, 3), ObjectType(classOf[Seq[Int]])),
       (Array(1, 2, 3), ObjectType(classOf[Array[Int]])),
       (Seq(1, 2, 3), ObjectType(classOf[Object])),
@@ -446,8 +449,8 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     testTypes.foreach { dt =>
       genSchema(dt).map { schema =>
         val row = RandomDataGenerator.randomRow(random, schema)
-        val rowConverter = RowEncoder(schema)
-        val internalRow = rowConverter.toRow(row)
+        val toRow = RowEncoder(schema).createSerializer()
+        val internalRow = toRow(row)
         val lambda = LambdaVariable("dummy", schema(0).dataType, schema(0).nullable, id = 0)
         checkEvaluationWithoutCodegen(lambda, internalRow.get(0, schema(0).dataType), internalRow)
       }
@@ -486,7 +489,8 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       ("abcd".getBytes, BinaryType),
       ("abcd", StringType),
       (BigDecimal.valueOf(10), DecimalType.IntDecimal),
-      (CalendarInterval.fromString("interval 3 day"), CalendarIntervalType),
+      (IntervalUtils.stringToInterval(UTF8String.fromString("interval 3 day")),
+        CalendarIntervalType),
       (java.math.BigDecimal.valueOf(10), DecimalType.BigIntDecimal),
       (Array(3, 2, 1), ArrayType(IntegerType))
     ).foreach { case (input, dt) =>
@@ -603,6 +607,16 @@ class ObjectExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
     checkExceptionInExpression[RuntimeException](
       serializer4, EmptyRow, "Cannot use null as map key!")
+  }
+
+  test("SPARK-35244: invoke should throw the original exception") {
+    val strClsType = ObjectType(classOf[String])
+    checkExceptionInExpression[StringIndexOutOfBoundsException](
+      Invoke(Literal("a", strClsType), "substring", strClsType, Seq(Literal(3))), "")
+
+    val mathCls = classOf[Math]
+    checkExceptionInExpression[ArithmeticException](
+      StaticInvoke(mathCls, IntegerType, "addExact", Seq(Literal(Int.MaxValue), Literal(1))), "")
   }
 }
 

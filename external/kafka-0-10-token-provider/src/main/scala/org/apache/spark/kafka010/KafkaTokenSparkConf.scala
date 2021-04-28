@@ -31,8 +31,10 @@ private[spark] case class KafkaTokenClusterConf(
     targetServersRegex: String,
     securityProtocol: String,
     kerberosServiceName: String,
+    trustStoreType: Option[String],
     trustStoreLocation: Option[String],
     trustStorePassword: Option[String],
+    keyStoreType: Option[String],
     keyStoreLocation: Option[String],
     keyStorePassword: Option[String],
     keyPassword: Option[String],
@@ -44,8 +46,10 @@ private[spark] case class KafkaTokenClusterConf(
     s"targetServersRegex=$targetServersRegex, " +
     s"securityProtocol=$securityProtocol, " +
     s"kerberosServiceName=$kerberosServiceName, " +
+    s"trustStoreType=$trustStoreType, " +
     s"trustStoreLocation=$trustStoreLocation, " +
     s"trustStorePassword=${trustStorePassword.map(_ => REDACTION_REPLACEMENT_TEXT)}, " +
+    s"keyStoreType=$keyStoreType, " +
     s"keyStoreLocation=$keyStoreLocation, " +
     s"keyStorePassword=${keyStorePassword.map(_ => REDACTION_REPLACEMENT_TEXT)}, " +
     s"keyPassword=${keyPassword.map(_ => REDACTION_REPLACEMENT_TEXT)}, " +
@@ -57,6 +61,7 @@ private [kafka010] object KafkaTokenSparkConf extends Logging {
   val CLUSTERS_CONFIG_PREFIX = "spark.kafka.clusters."
   val DEFAULT_TARGET_SERVERS_REGEX = ".*"
   val DEFAULT_SASL_KERBEROS_SERVICE_NAME = "kafka"
+  val DEFAULT_SECURITY_PROTOCOL_CONFIG = SASL_SSL.name
   val DEFAULT_SASL_TOKEN_MECHANISM = "SCRAM-SHA-512"
 
   def getClusterConfig(sparkConf: SparkConf, identifier: String): KafkaTokenClusterConf = {
@@ -72,11 +77,14 @@ private [kafka010] object KafkaTokenSparkConf extends Logging {
             s"${configPrefix}auth.${CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG}")),
       sparkClusterConf.getOrElse(s"target.${CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG}.regex",
         KafkaTokenSparkConf.DEFAULT_TARGET_SERVERS_REGEX),
-      sparkClusterConf.getOrElse(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, SASL_SSL.name),
+      sparkClusterConf.getOrElse(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG,
+        DEFAULT_SECURITY_PROTOCOL_CONFIG),
       sparkClusterConf.getOrElse(SaslConfigs.SASL_KERBEROS_SERVICE_NAME,
         KafkaTokenSparkConf.DEFAULT_SASL_KERBEROS_SERVICE_NAME),
+      sparkClusterConf.get(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG),
       sparkClusterConf.get(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG),
       sparkClusterConf.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG),
+      sparkClusterConf.get(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG),
       sparkClusterConf.get(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG),
       sparkClusterConf.get(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG),
       sparkClusterConf.get(SslConfigs.SSL_KEY_PASSWORD_CONFIG),

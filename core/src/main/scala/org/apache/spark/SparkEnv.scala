@@ -22,10 +22,11 @@ import java.net.Socket
 import java.util.Locale
 
 import scala.collection.JavaConverters._
+import scala.collection.concurrent
 import scala.collection.mutable
 import scala.util.Properties
 
-import com.google.common.collect.MapMaker
+import com.google.common.cache.CacheBuilder
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.annotation.DeveloperApi
@@ -36,7 +37,7 @@ import org.apache.spark.internal.config._
 import org.apache.spark.memory.{MemoryManager, UnifiedMemoryManager}
 import org.apache.spark.metrics.{MetricsSystem, MetricsSystemInstances}
 import org.apache.spark.network.netty.{NettyBlockTransferService, SparkTransportConf}
-import org.apache.spark.network.shuffle.ExternalShuffleClient
+import org.apache.spark.network.shuffle.ExternalBlockStoreClient
 import org.apache.spark.rpc.{RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.{LiveListenerBus, OutputCommitCoordinator}
 import org.apache.spark.scheduler.OutputCommitCoordinator.OutputCommitCoordinatorEndpoint
@@ -70,16 +71,17 @@ class SparkEnv (
     val outputCommitCoordinator: OutputCommitCoordinator,
     val conf: SparkConf) extends Logging {
 
-  private[spark] var isStopped = false
+  @volatile private[spark] var isStopped = false
   private val pythonWorkers = mutable.HashMap[(String, Map[String, String]), PythonWorkerFactory]()
 
   // A general, soft-reference map for metadata needed during HadoopRDD split computation
   // (e.g., HadoopFileRDD uses this to cache JobConfs and InputFormats).
-  private[spark] val hadoopJobMetadata = new MapMaker().softValues().makeMap[String, Any]()
+  private[spark] val hadoopJobMetadata =
+    CacheBuilder.newBuilder().softValues().build[String, AnyRef]().asMap()
 
   private[spark] var driverTmpDir: Option[String] = None
 
-  private[spark] def stop() {
+  private[spark] def stop(): Unit = {
 
     if (!isStopped) {
       isStopped = true
@@ -119,7 +121,8 @@ class SparkEnv (
   }
 
   private[spark]
-  def destroyPythonWorker(pythonExec: String, envVars: Map[String, String], worker: Socket) {
+  def destroyPythonWorker(pythonExec: String,
+      envVars: Map[String, String], worker: Socket): Unit = {
     synchronized {
       val key = (pythonExec, envVars)
       pythonWorkers.get(key).foreach(_.stopWorker(worker))
@@ -127,7 +130,8 @@ class SparkEnv (
   }
 
   private[spark]
-  def releasePythonWorker(pythonExec: String, envVars: Map[String, String], worker: Socket) {
+  def releasePythonWorker(pythonExec: String,
+      envVars: Map[String, String], worker: Socket): Unit = {
     synchronized {
       val key = (pythonExec, envVars)
       pythonWorkers.get(key).foreach(_.releaseWorker(worker))
@@ -141,7 +145,7 @@ object SparkEnv extends Logging {
   private[spark] val driverSystemName = "sparkDriver"
   private[spark] val executorSystemName = "sparkExecutor"
 
-  def set(e: SparkEnv) {
+  def set(e: SparkEnv): Unit = {
     env = e
   }
 
@@ -193,6 +197,7 @@ object SparkEnv extends Logging {
   private[spark] def createExecutorEnv(
       conf: SparkConf,
       executorId: String,
+      bindAddress: String,
       hostname: String,
       numCores: Int,
       ioEncryptionKey: Option[Array[Byte]],
@@ -200,7 +205,7 @@ object SparkEnv extends Logging {
     val env = create(
       conf,
       executorId,
-      hostname,
+      bindAddress,
       hostname,
       None,
       isLocal,
@@ -209,6 +214,17 @@ object SparkEnv extends Logging {
     )
     SparkEnv.set(env)
     env
+  }
+
+  private[spark] def createExecutorEnv(
+      conf: SparkConf,
+      executorId: String,
+      hostname: String,
+      numCores: Int,
+      ioEncryptionKey: Option[Array[Byte]],
+      isLocal: Boolean): SparkEnv = {
+    createExecutorEnv(conf, executorId, hostname,
+      hostname, numCores, ioEncryptionKey, isLocal)
   }
 
   /**
@@ -298,7 +314,7 @@ object SparkEnv extends Logging {
       }
     }
 
-    val broadcastManager = new BroadcastManager(isDriver, conf, securityManager)
+    val broadcastManager = new BroadcastManager(isDriver, conf)
 
     val mapOutputTracker = if (isDriver) {
       new MapOutputTrackerMaster(conf, broadcastManager, isLocal)
@@ -331,25 +347,33 @@ object SparkEnv extends Logging {
 
     val externalShuffleClient = if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
       val transConf = SparkTransportConf.fromSparkConf(conf, "shuffle", numUsableCores)
-      Some(new ExternalShuffleClient(transConf, securityManager,
+      Some(new ExternalBlockStoreClient(transConf, securityManager,
         securityManager.isAuthenticationEnabled(), conf.get(config.SHUFFLE_REGISTRATION_TIMEOUT)))
     } else {
       None
     }
 
-    val blockManagerMaster = new BlockManagerMaster(registerOrLookupEndpoint(
-      BlockManagerMaster.DRIVER_ENDPOINT_NAME,
-      new BlockManagerMasterEndpoint(
-        rpcEnv,
-        isLocal,
-        conf,
-        listenerBus,
-        if (conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)) {
-          externalShuffleClient
-        } else {
-          None
-        })),
-      conf, isDriver)
+    // Mapping from block manager id to the block manager's information.
+    val blockManagerInfo = new concurrent.TrieMap[BlockManagerId, BlockManagerInfo]()
+    val blockManagerMaster = new BlockManagerMaster(
+      registerOrLookupEndpoint(
+        BlockManagerMaster.DRIVER_ENDPOINT_NAME,
+        new BlockManagerMasterEndpoint(
+          rpcEnv,
+          isLocal,
+          conf,
+          listenerBus,
+          if (conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)) {
+            externalShuffleClient
+          } else {
+            None
+          }, blockManagerInfo,
+          mapOutputTracker.asInstanceOf[MapOutputTrackerMaster])),
+      registerOrLookupEndpoint(
+        BlockManagerMaster.DRIVER_HEARTBEAT_ENDPOINT_NAME,
+        new BlockManagerMasterHeartbeatEndpoint(rpcEnv, isLocal, blockManagerInfo)),
+      conf,
+      isDriver)
 
     val blockTransferService =
       new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress,
@@ -373,15 +397,14 @@ object SparkEnv extends Logging {
       // Don't start metrics system right now for Driver.
       // We need to wait for the task scheduler to give us an app ID.
       // Then we can start the metrics system.
-      MetricsSystem.createMetricsSystem(MetricsSystemInstances.DRIVER, conf, securityManager)
+      MetricsSystem.createMetricsSystem(MetricsSystemInstances.DRIVER, conf)
     } else {
       // We need to set the executor ID before the MetricsSystem is created because sources and
       // sinks specified in the metrics configuration file will want to incorporate this executor's
       // ID into the metrics they report.
       conf.set(EXECUTOR_ID, executorId)
-      val ms = MetricsSystem.createMetricsSystem(MetricsSystemInstances.EXECUTOR, conf,
-        securityManager)
-      ms.start()
+      val ms = MetricsSystem.createMetricsSystem(MetricsSystemInstances.EXECUTOR, conf)
+      ms.start(conf.get(METRICS_STATIC_SOURCES_ENABLED))
       ms
     }
 
@@ -430,7 +453,8 @@ object SparkEnv extends Logging {
       hadoopConf: Configuration,
       schedulingMode: String,
       addedJars: Seq[String],
-      addedFiles: Seq[String]): Map[String, Seq[(String, String)]] = {
+      addedFiles: Seq[String],
+      addedArchives: Seq[String]): Map[String, Seq[(String, String)]] = {
 
     import Properties._
     val jvmInformation = Seq(
@@ -460,7 +484,7 @@ object SparkEnv extends Logging {
       .split(File.pathSeparator)
       .filterNot(_.isEmpty)
       .map((_, "System Classpath"))
-    val addedJarsAndFiles = (addedJars ++ addedFiles).map((_, "Added By User"))
+    val addedJarsAndFiles = (addedJars ++ addedFiles ++ addedArchives).map((_, "Added By User"))
     val classPaths = (addedJarsAndFiles ++ classPathEntries).sorted
 
     // Add Hadoop properties, it will not ignore configs including in Spark. Some spark

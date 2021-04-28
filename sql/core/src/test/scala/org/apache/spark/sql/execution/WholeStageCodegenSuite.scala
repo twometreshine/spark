@@ -18,18 +18,19 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.{Dataset, QueryTest, Row, SaveMode}
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodeAndComment, CodeGenerator}
+import org.apache.spark.sql.catalyst.expressions.codegen.{ByteCodeStats, CodeAndComment, CodeGenerator}
+import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecutionSuite
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
-import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
-import org.apache.spark.sql.execution.joins.SortMergeJoinExec
-import org.apache.spark.sql.expressions.scalalang.typed
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
 
-class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
+// Disable AQE because the WholeStageCodegenExec is added when running QueryStageExec
+class WholeStageCodegenSuite extends QueryTest with SharedSparkSession
+  with DisableAdaptiveExecutionSuite {
 
   import testImplicits._
 
@@ -47,6 +48,85 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
       p.isInstanceOf[WholeStageCodegenExec] &&
         p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]).isDefined)
     assert(df.collect() === Array(Row(9, 4.5)))
+  }
+
+  testWithWholeStageCodegenOnAndOff("GenerateExec should be" +
+    " included in WholeStageCodegen") { codegenEnabled =>
+    import testImplicits._
+    val arrayData = Seq(("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown")))
+    val df = arrayData.toDF("name", "knownLanguages", "properties")
+
+    // Array - explode
+    var expDF = df.select($"name", explode($"knownLanguages"), $"properties")
+    var plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF, Array(Row("James", "Java", Map("hair" -> "black", "eye" -> "brown")),
+      Row("James", "Scala", Map("hair" -> "black", "eye" -> "brown"))))
+
+    // Map - explode
+    expDF = df.select($"name", $"knownLanguages", explode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF,
+      Array(Row("James", List("Java", "Scala"), "hair", "black"),
+        Row("James", List("Java", "Scala"), "eye", "brown")))
+
+    // Array - posexplode
+    expDF = df.select($"name", posexplode($"knownLanguages"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF,
+      Array(Row("James", 0, "Java"), Row("James", 1, "Scala")))
+
+    // Map - posexplode
+    expDF = df.select($"name", posexplode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF,
+      Array(Row("James", 0, "hair", "black"), Row("James", 1, "eye", "brown")))
+
+    // Array - explode , selecting all columns
+    expDF = df.select($"*", explode($"knownLanguages"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF,
+      Array(Row("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown"), "Java"),
+        Row("James", Seq("Java", "Scala"), Map("hair" -> "black", "eye" -> "brown"), "Scala")))
+
+    // Map - explode, selecting all columns
+    expDF = df.select($"*", explode($"properties"))
+    plan = expDF.queryExecution.executedPlan
+    assert(plan.find {
+      case stage: WholeStageCodegenExec =>
+        stage.find(_.isInstanceOf[GenerateExec]).isDefined
+      case _ => !codegenEnabled.toBoolean
+    }.isDefined)
+    checkAnswer(expDF,
+      Array(
+        Row("James", List("Java", "Scala"),
+          Map("hair" -> "black", "eye" -> "brown"), "hair", "black"),
+        Row("James", List("Java", "Scala"),
+          Map("hair" -> "black", "eye" -> "brown"), "eye", "brown")))
   }
 
   test("Aggregate with grouping keys should be included in WholeStageCodegen") {
@@ -67,6 +147,151 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
       p.isInstanceOf[WholeStageCodegenExec] &&
         p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[BroadcastHashJoinExec]).isDefined)
     assert(df.collect() === Array(Row(1, 1, "1"), Row(1, 1, "1"), Row(2, 2, "2")))
+  }
+
+  test("ShuffledHashJoin should be included in WholeStageCodegen") {
+    val df1 = spark.range(5).select($"id".as("k1"))
+    val df2 = spark.range(15).select($"id".as("k2"))
+    val df3 = spark.range(6).select($"id".as("k3"))
+
+    // test one shuffled hash join
+    val oneJoinDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
+    assert(oneJoinDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+    }.size === 1)
+    checkAnswer(oneJoinDF, Seq(Row(0, 0), Row(1, 1), Row(2, 2), Row(3, 3), Row(4, 4)))
+
+    // test two shuffled hash joins
+    val twoJoinsDF = df1.join(df2.hint("SHUFFLE_HASH"), $"k1" === $"k2")
+      .join(df3.hint("SHUFFLE_HASH"), $"k1" === $"k3")
+    assert(twoJoinsDF.queryExecution.executedPlan.collect {
+      case WholeStageCodegenExec(_ : ShuffledHashJoinExec) => true
+    }.size === 2)
+    checkAnswer(twoJoinsDF,
+      Seq(Row(0, 0, 0), Row(1, 1, 1), Row(2, 2, 2), Row(3, 3, 3), Row(4, 4, 4)))
+  }
+
+  test("Inner/Cross BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test broadcast nested loop join without condition
+        val oneJoinDF = df1.join(df2)
+        var hasJoinInCodegen = oneJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(oneJoinDF,
+          Seq(Row(0, 0), Row(0, 1), Row(0, 2), Row(1, 0), Row(1, 1), Row(1, 2),
+            Row(2, 0), Row(2, 1), Row(2, 2), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test broadcast nested loop join with condition
+        val oneJoinDFWithCondition = df1.join(df2, $"k1" + 1 =!= $"k2")
+        hasJoinInCodegen = oneJoinDFWithCondition.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_ : BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(oneJoinDFWithCondition,
+          Seq(Row(0, 0), Row(0, 2), Row(1, 0), Row(1, 1), Row(2, 0), Row(2, 1),
+            Row(2, 2), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test two broadcast nested loop joins
+        val twoJoinsDF = df1.join(df2, $"k1" < $"k2").crossJoin(df3)
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
+            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF,
+          Seq(Row(0, 1, 0), Row(0, 2, 0), Row(1, 2, 0), Row(0, 1, 1), Row(0, 2, 1), Row(1, 2, 1)))
+      }
+    }
+  }
+
+  test("Left/Right outer BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+    val df4 = spark.range(0).select($"id".as("k4"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test left outer join
+        val leftOuterJoinDF = df1.join(df2, $"k1" > $"k2", "left_outer")
+        var hasJoinInCodegen = leftOuterJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(leftOuterJoinDF,
+          Seq(Row(0, null), Row(1, 0), Row(2, 0), Row(2, 1), Row(3, 0), Row(3, 1), Row(3, 2)))
+
+        // test right outer join
+        val rightOuterJoinDF = df1.join(df2, $"k1" < $"k2", "right_outer")
+        hasJoinInCodegen = rightOuterJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(rightOuterJoinDF, Seq(Row(null, 0), Row(0, 1), Row(0, 2), Row(1, 2)))
+
+        // test a combination of left outer and right outer joins
+        val twoJoinsDF = df1.join(df2, $"k1" > $"k2" + 1, "right_outer")
+          .join(df3, $"k1" <= $"k3", "left_outer")
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(BroadcastNestedLoopJoinExec(
+            _: BroadcastNestedLoopJoinExec, _, _, _, _)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF,
+          Seq(Row(2, 0, null), Row(3, 0, null), Row(3, 1, null), Row(null, 2, null)))
+
+        // test build side is empty
+        val buildSideIsEmptyDF = df3.join(df4, $"k3" > $"k4", "left_outer")
+        hasJoinInCodegen = buildSideIsEmptyDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(_: BroadcastNestedLoopJoinExec) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(buildSideIsEmptyDF, Seq(Row(0, null), Row(1, null)))
+      }
+    }
+  }
+
+  test("Left semi/anti BroadcastNestedLoopJoinExec should be included in WholeStageCodegen") {
+    val df1 = spark.range(4).select($"id".as("k1"))
+    val df2 = spark.range(3).select($"id".as("k2"))
+    val df3 = spark.range(2).select($"id".as("k3"))
+
+    Seq(true, false).foreach { codegenEnabled =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> codegenEnabled.toString) {
+        // test left semi join
+        val semiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_semi")
+        var hasJoinInCodegen = semiJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(semiJoinDF, Seq(Row(0), Row(1)))
+
+        // test left anti join
+        val antiJoinDF = df1.join(df2, $"k1" + 1 <= $"k2", "left_anti")
+        hasJoinInCodegen = antiJoinDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, _ : BroadcastNestedLoopJoinExec)) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(antiJoinDF, Seq(Row(2), Row(3)))
+
+        // test a combination of left semi and left anti joins
+        val twoJoinsDF = df1.join(df2, $"k1" < $"k2", "left_semi")
+          .join(df3, $"k1" > $"k3", "left_anti")
+        hasJoinInCodegen = twoJoinsDF.queryExecution.executedPlan.collect {
+          case WholeStageCodegenExec(ProjectExec(_, BroadcastNestedLoopJoinExec(
+          _: BroadcastNestedLoopJoinExec, _, _, _, _))) => true
+        }.size === 1
+        assert(hasJoinInCodegen == codegenEnabled)
+        checkAnswer(twoJoinsDF, Seq(Row(0)))
+      }
+    }
   }
 
   test("Sort should be included in WholeStageCodegen") {
@@ -107,17 +332,28 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
     assert(ds.collect() === Array(0, 6))
   }
 
-  test("simple typed UDAF should be included in WholeStageCodegen") {
+  test("cache for primitive type should be in WholeStageCodegen with InMemoryTableScanExec") {
     import testImplicits._
 
-    val ds = Seq(("a", 10), ("b", 1), ("b", 2), ("c", 1)).toDS()
-      .groupByKey(_._1).agg(typed.sum(_._2))
+    val dsInt = spark.range(3).cache()
+    dsInt.count()
+    val dsIntFilter = dsInt.filter(_ > 0)
+    val planInt = dsIntFilter.queryExecution.executedPlan
+    assert(planInt.collect {
+      case WholeStageCodegenExec(FilterExec(_,
+          ColumnarToRowExec(InputAdapter(_: InMemoryTableScanExec)))) => ()
+    }.length == 1)
+    assert(dsIntFilter.collect() === Array(1, 2))
 
-    val plan = ds.queryExecution.executedPlan
-    assert(plan.find(p =>
-      p.isInstanceOf[WholeStageCodegenExec] &&
-        p.asInstanceOf[WholeStageCodegenExec].child.isInstanceOf[HashAggregateExec]).isDefined)
-    assert(ds.collect() === Array(("a", 10.0), ("b", 3.0), ("c", 1.0)))
+    // cache for string type is not supported for InMemoryTableScanExec
+    val dsString = spark.range(3).map(_.toString).cache()
+    dsString.count()
+    val dsStringFilter = dsString.filter(_ == "1")
+    val planString = dsStringFilter.queryExecution.executedPlan
+    assert(planString.collect {
+      case _: ColumnarToRowExec => ()
+    }.isEmpty)
+    assert(dsStringFilter.collect() === Array("1"))
   }
 
   test("SPARK-19512 codegen for comparing structs is incorrect") {
@@ -189,11 +425,30 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
 
   ignore("SPARK-21871 check if we can get large code size when compiling too long functions") {
     val codeWithShortFunctions = genGroupByCode(3)
-    val (_, maxCodeSize1) = CodeGenerator.compile(codeWithShortFunctions)
+    val (_, ByteCodeStats(maxCodeSize1, _, _)) = CodeGenerator.compile(codeWithShortFunctions)
     assert(maxCodeSize1 < SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.defaultValue.get)
     val codeWithLongFunctions = genGroupByCode(50)
-    val (_, maxCodeSize2) = CodeGenerator.compile(codeWithLongFunctions)
+    val (_, ByteCodeStats(maxCodeSize2, _, _)) = CodeGenerator.compile(codeWithLongFunctions)
     assert(maxCodeSize2 > SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.defaultValue.get)
+  }
+
+  ignore("bytecode of batch file scan exceeds the limit of WHOLESTAGE_HUGE_METHOD_LIMIT") {
+    import testImplicits._
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.range(10).select(Seq.tabulate(201) {i => ('id + i).as(s"c$i")} : _*)
+      df.write.mode(SaveMode.Overwrite).parquet(path)
+
+      withSQLConf(SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "202",
+        SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.key -> "2000") {
+        // wide table batch scan causes the byte code of codegen exceeds the limit of
+        // WHOLESTAGE_HUGE_METHOD_LIMIT
+        val df2 = spark.read.parquet(path)
+        val fileScan2 = df2.queryExecution.sparkPlan.find(_.isInstanceOf[FileSourceScanExec]).get
+        assert(fileScan2.asInstanceOf[FileSourceScanExec].supportsColumnar)
+        checkAnswer(df2, df)
+      }
+    }
   }
 
   test("Control splitting consume function by operators with config") {
@@ -310,7 +565,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
         .join(baseTable, "idx")
       assert(distinctWithId.queryExecution.executedPlan.collectFirst {
         case WholeStageCodegenExec(
-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _))) => true
+          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
       }.isDefined)
       checkAnswer(distinctWithId, Seq(Row(1, 0), Row(1, 0)))
 
@@ -321,7 +576,7 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
         .join(baseTable, "idx")
       assert(groupByWithId.queryExecution.executedPlan.collectFirst {
         case WholeStageCodegenExec(
-          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _))) => true
+          ProjectExec(_, BroadcastHashJoinExec(_, _, _, _, _, _: HashAggregateExec, _, _))) => true
       }.isDefined)
       checkAnswer(groupByWithId, Seq(Row(1, 2, 0), Row(1, 2, 0)))
     }
@@ -342,8 +597,8 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
     // Case2: The parent of a LocalTableScanExec supports WholeStageCodegen.
     // In this case, the LocalTableScanExec should be within a WholeStageCodegen domain
     // and no more InputAdapter is inserted as the direct parent of the LocalTableScanExec.
-    val aggedDF = Seq(1, 2, 3).toDF.groupBy("value").sum()
-    val executedPlan = aggedDF.queryExecution.executedPlan
+    val aggregatedDF = Seq(1, 2, 3).toDF.groupBy("value").sum()
+    val executedPlan = aggregatedDF.queryExecution.executedPlan
 
     // HashAggregateExec supports WholeStageCodegen and it's the parent of
     // LocalTableScanExec so LocalTableScanExec should be within a WholeStageCodegen domain.
@@ -354,5 +609,49 @@ class WholeStageCodegenSuite extends QueryTest with SharedSQLContext {
         case _ => false
       }.isDefined,
       "LocalTableScanExec should be within a WholeStageCodegen domain.")
+  }
+
+  test("Give up splitting aggregate code if a parameter length goes over the limit") {
+    withSQLConf(
+        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "true",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      withTable("t") {
+        val expectedErrMsg = "Failed to split aggregate code into small functions"
+        Seq(
+          // Test case without keys
+          "SELECT AVG(v) FROM VALUES(1) t(v)",
+          // Tet case with keys
+          "SELECT k, AVG(v) FROM VALUES((1, 1)) t(k, v) GROUP BY k").foreach { query =>
+          val errMsg = intercept[IllegalStateException] {
+            sql(query).collect
+          }.getMessage
+          assert(errMsg.contains(expectedErrMsg))
+        }
+      }
+    }
+  }
+
+  test("Give up splitting subexpression code if a parameter length goes over the limit") {
+    withSQLConf(
+        SQLConf.CODEGEN_SPLIT_AGGREGATE_FUNC.key -> "false",
+        SQLConf.CODEGEN_METHOD_SPLIT_THRESHOLD.key -> "1",
+        "spark.sql.CodeGenerator.validParamLength" -> "0") {
+      withTable("t") {
+        val expectedErrMsg = "Failed to split subexpression code into small functions"
+        Seq(
+          // Test case without keys
+          "SELECT AVG(a + b), SUM(a + b + c) FROM VALUES((1, 1, 1)) t(a, b, c)",
+          // Tet case with keys
+          "SELECT k, AVG(a + b), SUM(a + b + c) FROM VALUES((1, 1, 1, 1)) t(k, a, b, c) " +
+            "GROUP BY k").foreach { query =>
+          val e = intercept[Exception] {
+            sql(query).collect
+          }
+          assert(e.isInstanceOf[IllegalStateException])
+          assert(e.getMessage.contains(expectedErrMsg))
+        }
+      }
+    }
   }
 }

@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, PythonUDF}
 
 /**
- * FlatMap groups using an udf: pandas.Dataframe -> pandas.DataFrame.
+ * FlatMap groups using a udf: pandas.Dataframe -> pandas.DataFrame.
  * This is used by DataFrame.groupby().apply().
  */
 case class FlatMapGroupsInPandas(
@@ -37,10 +37,13 @@ case class FlatMapGroupsInPandas(
    * from the input.
    */
   override val producedAttributes = AttributeSet(output)
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): FlatMapGroupsInPandas =
+    copy(child = newChild)
 }
 
 /**
- * Map partitions using an udf: iter(pandas.Dataframe) -> iter(pandas.DataFrame).
+ * Map partitions using a udf: iter(pandas.Dataframe) -> iter(pandas.DataFrame).
  * This is used by DataFrame.mapInPandas()
  */
 case class MapInPandas(
@@ -49,6 +52,34 @@ case class MapInPandas(
     child: LogicalPlan) extends UnaryNode {
 
   override val producedAttributes = AttributeSet(output)
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): MapInPandas =
+    copy(child = newChild)
+}
+
+/**
+ * Flatmap cogroups using a udf: pandas.Dataframe, pandas.Dataframe -> pandas.Dataframe
+ * This is used by DataFrame.groupby().cogroup().apply().
+ */
+case class FlatMapCoGroupsInPandas(
+    leftGroupingLen: Int,
+    rightGroupingLen: Int,
+    functionExpr: Expression,
+    output: Seq[Attribute],
+    left: LogicalPlan,
+    right: LogicalPlan) extends BinaryNode {
+
+  override val producedAttributes = AttributeSet(output)
+  override lazy val references: AttributeSet =
+    AttributeSet(leftAttributes ++ rightAttributes ++ functionExpr.references) -- producedAttributes
+
+  def leftAttributes: Seq[Attribute] = left.output.take(leftGroupingLen)
+
+  def rightAttributes: Seq[Attribute] = right.output.take(rightGroupingLen)
+
+  override protected def withNewChildrenInternal(
+      newLeft: LogicalPlan, newRight: LogicalPlan): FlatMapCoGroupsInPandas =
+    copy(left = newLeft, right = newRight)
 }
 
 trait BaseEvalPython extends UnaryNode {
@@ -68,7 +99,10 @@ trait BaseEvalPython extends UnaryNode {
 case class BatchEvalPython(
     udfs: Seq[PythonUDF],
     resultAttrs: Seq[Attribute],
-    child: LogicalPlan) extends BaseEvalPython
+    child: LogicalPlan) extends BaseEvalPython {
+  override protected def withNewChildInternal(newChild: LogicalPlan): BatchEvalPython =
+    copy(child = newChild)
+}
 
 /**
  * A logical plan that evaluates a [[PythonUDF]] with Apache Arrow.
@@ -77,4 +111,7 @@ case class ArrowEvalPython(
     udfs: Seq[PythonUDF],
     resultAttrs: Seq[Attribute],
     child: LogicalPlan,
-    evalType: Int) extends BaseEvalPython
+    evalType: Int) extends BaseEvalPython {
+  override protected def withNewChildInternal(newChild: LogicalPlan): ArrowEvalPython =
+    copy(child = newChild)
+}

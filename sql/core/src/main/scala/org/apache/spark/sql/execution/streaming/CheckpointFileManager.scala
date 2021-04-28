@@ -160,11 +160,17 @@ object CheckpointFileManager extends Logging {
     override def cancel(): Unit = synchronized {
       try {
         if (terminated) return
-        underlyingStream.close()
+        try {
+          underlyingStream.close()
+        } catch {
+          case NonFatal(e) =>
+            logWarning(s"Error cancelling write to $finalPath, " +
+              s"continuing to delete temp path $tempPath", e)
+        }
         fm.delete(tempPath)
       } catch {
         case NonFatal(e) =>
-          logWarning(s"Error cancelling write to $finalPath", e)
+          logWarning(s"Error deleting temp file $tempPath", e)
       } finally {
         terminated = true
       }
@@ -271,7 +277,6 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
       fs.delete(path, true)
     } catch {
       case e: FileNotFoundException =>
-        logInfo(s"Failed to delete $path as it does not exist")
         // ignore if file has already been deleted
     }
   }
@@ -327,6 +332,8 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
   override def renameTempFile(srcPath: Path, dstPath: Path, overwriteIfPossible: Boolean): Unit = {
     import Options.Rename._
     fc.rename(srcPath, dstPath, if (overwriteIfPossible) OVERWRITE else NONE)
+    // TODO: this is a workaround of HADOOP-16255 - remove this when HADOOP-16255 is resolved
+    mayRemoveCrcFile(srcPath)
   }
 
 
@@ -342,6 +349,18 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
   override def isLocal: Boolean = fc.getDefaultFileSystem match {
     case _: LocalFs | _: RawLocalFs => true // LocalFs = RawLocalFs + ChecksumFs
     case _ => false
+  }
+
+  private def mayRemoveCrcFile(path: Path): Unit = {
+    try {
+      val checksumFile = new Path(path.getParent, s".${path.getName}.crc")
+      if (exists(checksumFile)) {
+        // checksum file exists, deleting it
+        delete(checksumFile)
+      }
+    } catch {
+      case NonFatal(_) => // ignore, we are removing crc file as "best-effort"
+    }
   }
 }
 

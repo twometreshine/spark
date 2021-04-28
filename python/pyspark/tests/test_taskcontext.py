@@ -23,7 +23,7 @@ import time
 import unittest
 
 from pyspark import SparkConf, SparkContext, TaskContext, BarrierTaskContext
-from pyspark.testing.utils import PySparkTestCase
+from pyspark.testing.utils import PySparkTestCase, SPARK_HOME, eventually
 
 
 class TaskContextTests(PySparkTestCase):
@@ -124,12 +124,32 @@ class TaskContextTests(PySparkTestCase):
 
         def context_barrier(x):
             tc = BarrierTaskContext.get()
-            time.sleep(random.randint(1, 10))
+            time.sleep(random.randint(1, 5) * 2)
             tc.barrier()
             return time.time()
 
         times = rdd.barrier().mapPartitions(f).map(context_barrier).collect()
-        self.assertTrue(max(times) - min(times) < 1)
+        self.assertTrue(max(times) - min(times) < 2)
+
+    def test_all_gather(self):
+        """
+        Verify that BarrierTaskContext.allGather() performs global sync among all barrier tasks
+        within a stage and passes messages properly.
+        """
+        rdd = self.sc.parallelize(range(10), 4)
+
+        def f(iterator):
+            yield sum(iterator)
+
+        def context_barrier(x):
+            tc = BarrierTaskContext.get()
+            time.sleep(random.randint(1, 10))
+            out = tc.allGather(str(tc.partitionId()))
+            pids = [int(e) for e in out]
+            return pids
+
+        pids = rdd.barrier().mapPartitions(f).map(context_barrier).collect()[0]
+        self.assertEqual(pids, [0, 1, 2, 3])
 
     def test_barrier_infos(self):
         """
@@ -145,6 +165,49 @@ class TaskContextTests(PySparkTestCase):
                                                        .getTaskInfos()).collect()
         self.assertTrue(len(taskInfos) == 4)
         self.assertTrue(len(taskInfos[0]) == 4)
+
+    def test_context_get(self):
+        """
+        Verify that TaskContext.get() works both in or not in a barrier stage.
+        """
+        rdd = self.sc.parallelize(range(10), 4)
+
+        def f(iterator):
+            taskContext = TaskContext.get()
+            if isinstance(taskContext, BarrierTaskContext):
+                yield taskContext.partitionId() + 1
+            elif isinstance(taskContext, TaskContext):
+                yield taskContext.partitionId() + 2
+            else:
+                yield -1
+
+        # for normal stage
+        result1 = rdd.mapPartitions(f).collect()
+        self.assertTrue(result1 == [2, 3, 4, 5])
+        # for barrier stage
+        result2 = rdd.barrier().mapPartitions(f).collect()
+        self.assertTrue(result2 == [1, 2, 3, 4])
+
+    def test_barrier_context_get(self):
+        """
+        Verify that BarrierTaskContext.get() should only works in a barrier stage.
+        """
+        rdd = self.sc.parallelize(range(10), 4)
+
+        def f(iterator):
+            try:
+                taskContext = BarrierTaskContext.get()
+            except Exception:
+                yield -1
+            else:
+                yield taskContext.partitionId()
+
+        # for normal stage
+        result1 = rdd.mapPartitions(f).collect()
+        self.assertTrue(result1 == [-1, -1, -1, -1])
+        # for barrier stage
+        result2 = rdd.barrier().mapPartitions(f).collect()
+        self.assertTrue(result2 == [0, 1, 2, 3])
 
 
 class TaskContextTestsWithWorkerReuse(unittest.TestCase):
@@ -169,7 +232,7 @@ class TaskContextTestsWithWorkerReuse(unittest.TestCase):
 
         def context_barrier(x):
             tc = BarrierTaskContext.get()
-            time.sleep(random.randint(1, 10))
+            time.sleep(random.randint(1, 5) * 2)
             tc.barrier()
             return (time.time(), os.getpid())
 
@@ -177,9 +240,55 @@ class TaskContextTestsWithWorkerReuse(unittest.TestCase):
         times = list(map(lambda x: x[0], result))
         pids = list(map(lambda x: x[1], result))
         # check both barrier and worker reuse effect
-        self.assertTrue(max(times) - min(times) < 1)
+        self.assertTrue(max(times) - min(times) < 2)
         for pid in pids:
             self.assertTrue(pid in worker_pids)
+
+    def check_task_context_correct_with_python_worker_reuse(self):
+        """Verify the task context correct when reused python worker"""
+        # start a normal job first to start all workers and get all worker pids
+        worker_pids = self.sc.parallelize(range(2), 2).map(lambda x: os.getpid()).collect()
+        # the worker will reuse in this barrier job
+        rdd = self.sc.parallelize(range(10), 2)
+
+        def context(iterator):
+            tp = TaskContext.get().partitionId()
+            try:
+                bp = BarrierTaskContext.get().partitionId()
+            except Exception:
+                bp = -1
+
+            yield (tp, bp, os.getpid())
+
+        # normal stage after normal stage
+        normal_result = rdd.mapPartitions(context).collect()
+        tps, bps, pids = zip(*normal_result)
+        self.assertTrue(tps == (0, 1))
+        self.assertTrue(bps == (-1, -1))
+        for pid in pids:
+            self.assertTrue(pid in worker_pids)
+        # barrier stage after normal stage
+        barrier_result = rdd.barrier().mapPartitions(context).collect()
+        tps, bps, pids = zip(*barrier_result)
+        self.assertTrue(tps == (0, 1))
+        self.assertTrue(bps == (0, 1))
+        for pid in pids:
+            self.assertTrue(pid in worker_pids)
+        # normal stage after barrier stage
+        normal_result2 = rdd.mapPartitions(context).collect()
+        tps, bps, pids = zip(*normal_result2)
+        self.assertTrue(tps == (0, 1))
+        self.assertTrue(bps == (-1, -1))
+        for pid in pids:
+            self.assertTrue(pid in worker_pids)
+        return True
+
+    def test_task_context_correct_with_python_worker_reuse(self):
+        # Retrying the check as the PIDs from Python workers might be different even
+        # when reusing Python workers is enabled if a Python worker is dead for some reasons
+        # (e.g., socket connection failure) and new Python worker is created.
+        eventually(
+            self.check_task_context_correct_with_python_worker_reuse, catch_assertions=True)
 
     def tearDown(self):
         self.sc.stop()
@@ -192,11 +301,16 @@ class TaskContextTestsWithResources(unittest.TestCase):
         self.tempFile = tempfile.NamedTemporaryFile(delete=False)
         self.tempFile.write(b'echo {\\"name\\": \\"gpu\\", \\"addresses\\": [\\"0\\"]}')
         self.tempFile.close()
+        # create temporary directory for Worker resources coordination
+        self.tempdir = tempfile.NamedTemporaryFile(delete=False)
+        os.unlink(self.tempdir.name)
         os.chmod(self.tempFile.name, stat.S_IRWXU | stat.S_IXGRP | stat.S_IRGRP |
                  stat.S_IROTH | stat.S_IXOTH)
-        conf = SparkConf().set("spark.task.resource.gpu.amount", "1")
+        conf = SparkConf().set("spark.test.home", SPARK_HOME)
+        conf = conf.set("spark.worker.resource.gpu.discoveryScript", self.tempFile.name)
+        conf = conf.set("spark.worker.resource.gpu.amount", 1)
+        conf = conf.set("spark.task.resource.gpu.amount", "1")
         conf = conf.set("spark.executor.resource.gpu.amount", "1")
-        conf = conf.set("spark.executor.resource.gpu.discoveryScript", self.tempFile.name)
         self.sc = SparkContext('local-cluster[2,1,1024]', class_name, conf=conf)
 
     def test_resources(self):
@@ -214,10 +328,10 @@ class TaskContextTestsWithResources(unittest.TestCase):
 
 if __name__ == "__main__":
     import unittest
-    from pyspark.tests.test_taskcontext import *
+    from pyspark.tests.test_taskcontext import *  # noqa: F401
 
     try:
-        import xmlrunner
+        import xmlrunner  # type: ignore[import]
         testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None

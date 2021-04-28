@@ -29,7 +29,6 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
@@ -50,6 +49,13 @@ class ColumnarRule {
 }
 
 /**
+ * A trait that is used as a tag to indicate a transition from columns to rows. This allows plugins
+ * to replace the current [[ColumnarToRowExec]] with an optimized version and still have operations
+ * that walk a spark plan looking for this type of transition properly match it.
+ */
+trait ColumnarToRowTransition extends UnaryExecNode
+
+/**
  * Provides a common executor to translate an [[RDD]] of [[ColumnarBatch]] into an [[RDD]] of
  * [[InternalRow]]. This is inserted whenever such a transition is determined to be needed.
  *
@@ -57,8 +63,8 @@ class ColumnarRule {
  * [[org.apache.spark.sql.execution.python.ArrowEvalPythonExec]] and
  * [[MapPartitionsInRWithArrowExec]]. Eventually this should replace those implementations.
  */
-case class ColumnarToRowExec(child: SparkPlan)
-  extends UnaryExecNode with CodegenSupport {
+case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition with CodegenSupport {
+  assert(child.supportsColumnar)
 
   override def output: Seq[Attribute] = child.output
 
@@ -66,31 +72,29 @@ case class ColumnarToRowExec(child: SparkPlan)
 
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
+  // `ColumnarToRowExec` processes the input RDD directly, which is kind of a leaf node in the
+  // codegen stage and needs to do the limit check.
+  protected override def canCheckLimitNotReached: Boolean = true
+
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
-    "numInputBatches" -> SQLMetrics.createMetric(sparkContext, "number of input batches"),
-    "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
+    "numInputBatches" -> SQLMetrics.createMetric(sparkContext, "number of input batches")
   )
 
   override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
     val numInputBatches = longMetric("numInputBatches")
-    val scanTime = longMetric("scanTime")
-    // UnsafeProjection is not serializable so do it on the executor side, which is why it is lazy
-    @transient lazy val outputProject = UnsafeProjection.create(output, output)
-    val batches = child.executeColumnar()
-    batches.flatMap(batch => {
-      val batchStartNs = System.nanoTime()
-      numInputBatches += 1
-      // In order to match the numOutputRows metric in the generated code we update
-      // numOutputRows for each batch. This is less accurate than doing it at output
-      // because it will over count the number of rows output in the case of a limit,
-      // but it is more efficient.
-      numOutputRows += batch.numRows()
-      val ret = batch.rowIterator().asScala
-      scanTime += ((System.nanoTime() - batchStartNs) / (1000 * 1000))
-      ret.map(outputProject)
-    })
+    // This avoids calling `output` in the RDD closure, so that we don't need to include the entire
+    // plan (this) in the closure.
+    val localOutput = this.output
+    child.executeColumnar().mapPartitionsInternal { batches =>
+      val toUnsafe = UnsafeProjection.create(localOutput, localOutput)
+      batches.flatMap { batch =>
+        numInputBatches += 1
+        numOutputRows += batch.numRows()
+        batch.rowIterator().asScala.map(toUnsafe)
+      }
+    }
   }
 
   /**
@@ -136,9 +140,6 @@ case class ColumnarToRowExec(child: SparkPlan)
     // metrics
     val numOutputRows = metricTerm(ctx, "numOutputRows")
     val numInputBatches = metricTerm(ctx, "numInputBatches")
-    val scanTimeMetric = metricTerm(ctx, "scanTime")
-    val scanTimeTotalNs =
-      ctx.addMutableState(CodeGenerator.JAVA_LONG, "scanTime") // init as scanTime = 0
 
     val columnarBatchClz = classOf[ColumnarBatch].getName
     val batch = ctx.addMutableState(columnarBatchClz, "batch")
@@ -156,15 +157,13 @@ case class ColumnarToRowExec(child: SparkPlan)
     val nextBatchFuncName = ctx.addNewFunction(nextBatch,
       s"""
          |private void $nextBatch() throws java.io.IOException {
-         |  long getBatchStart = System.nanoTime();
          |  if ($input.hasNext()) {
          |    $batch = ($columnarBatchClz)$input.next();
+         |    $numInputBatches.add(1);
          |    $numOutputRows.add($batch.numRows());
          |    $idx = 0;
          |    ${columnAssigns.mkString("", "\n", "\n")}
-         |    ${numInputBatches}.add(1);
          |  }
-         |  $scanTimeTotalNs += System.nanoTime() - getBatchStart;
          |}""".stripMargin)
 
     ctx.currentVars = null
@@ -184,7 +183,7 @@ case class ColumnarToRowExec(child: SparkPlan)
        |if ($batch == null) {
        |  $nextBatchFuncName();
        |}
-       |while ($batch != null) {
+       |while ($limitNotReachedCond $batch != null) {
        |  int $numRows = $batch.numRows();
        |  int $localEnd = $numRows - $idx;
        |  for (int $localIdx = 0; $localIdx < $localEnd; $localIdx++) {
@@ -196,14 +195,15 @@ case class ColumnarToRowExec(child: SparkPlan)
        |  $batch = null;
        |  $nextBatchFuncName();
        |}
-       |$scanTimeMetric.add($scanTimeTotalNs / (1000 * 1000));
-       |$scanTimeTotalNs = 0;
      """.stripMargin
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
-    child.asInstanceOf[CodegenSupport].inputRDDs()
+    Seq(child.executeColumnar().asInstanceOf[RDD[InternalRow]]) // Hack because of type erasure
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): ColumnarToRowExec =
+    copy(child = newChild)
 }
 
 /**
@@ -332,7 +332,8 @@ private object RowToColumnConverter {
       val c = row.getInterval(column)
       cv.appendStruct(false)
       cv.getChild(0).appendInt(c.months)
-      cv.getChild(1).appendLong(c.microseconds)
+      cv.getChild(1).appendInt(c.days)
+      cv.getChild(2).appendLong(c.microseconds)
     }
   }
 
@@ -394,6 +395,13 @@ private object RowToColumnConverter {
 }
 
 /**
+ * A trait that is used as a tag to indicate a transition from rows to columns. This allows plugins
+ * to replace the current [[RowToColumnarExec]] with an optimized version and still have operations
+ * that walk a spark plan looking for this type of transition properly match it.
+ */
+trait RowToColumnarTransition extends UnaryExecNode
+
+/**
  * Provides a common executor to translate an [[RDD]] of [[InternalRow]] into an [[RDD]] of
  * [[ColumnarBatch]]. This is inserted whenever such a transition is determined to be needed.
  *
@@ -410,7 +418,7 @@ private object RowToColumnConverter {
  * populate with [[RowToColumnConverter]], but the performance requirements are different and it
  * would only be to reduce code.
  */
-case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
+case class RowToColumnarExec(child: SparkPlan) extends RowToColumnarTransition {
   override def output: Seq[Attribute] = child.output
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
@@ -439,55 +447,59 @@ case class RowToColumnarExec(child: SparkPlan) extends UnaryExecNode {
     // Instead of creating a new config we are reusing columnBatchSize. In the future if we do
     // combine with some of the Arrow conversion tools we will need to unify some of the configs.
     val numRows = conf.columnBatchSize
-    val converters = new RowToColumnConverter(schema)
-    val rowBased = child.execute()
-    rowBased.mapPartitions(rowIterator => {
-      new Iterator[ColumnarBatch] {
-        var cb: ColumnarBatch = null
-
-        TaskContext.get().addTaskCompletionListener[Unit] { _ =>
-          if (cb != null) {
-            cb.close()
-            cb = null
+    // This avoids calling `schema` in the RDD closure, so that we don't need to include the entire
+    // plan (this) in the closure.
+    val localSchema = this.schema
+    child.execute().mapPartitionsInternal { rowIterator =>
+      if (rowIterator.hasNext) {
+        new Iterator[ColumnarBatch] {
+          private val converters = new RowToColumnConverter(localSchema)
+          private val vectors: Seq[WritableColumnVector] = if (enableOffHeapColumnVector) {
+            OffHeapColumnVector.allocateColumns(numRows, localSchema)
+          } else {
+            OnHeapColumnVector.allocateColumns(numRows, localSchema)
           }
-        }
+          private val cb: ColumnarBatch = new ColumnarBatch(vectors.toArray)
 
-        override def hasNext: Boolean = {
-          rowIterator.hasNext
-        }
-
-        override def next(): ColumnarBatch = {
-          if (cb != null) {
+          TaskContext.get().addTaskCompletionListener[Unit] { _ =>
             cb.close()
-            cb = null
           }
-          val columnVectors : Array[WritableColumnVector] =
-            if (enableOffHeapColumnVector) {
-              OffHeapColumnVector.allocateColumns(numRows, schema).toArray
-            } else {
-              OnHeapColumnVector.allocateColumns(numRows, schema).toArray
+
+          override def hasNext: Boolean = {
+            rowIterator.hasNext
+          }
+
+          override def next(): ColumnarBatch = {
+            cb.setNumRows(0)
+            vectors.foreach(_.reset())
+            var rowCount = 0
+            while (rowCount < numRows && rowIterator.hasNext) {
+              val row = rowIterator.next()
+              converters.convert(row, vectors.toArray)
+              rowCount += 1
             }
-          var rowCount = 0
-          while (rowCount < numRows && rowIterator.hasNext) {
-            val row = rowIterator.next()
-            converters.convert(row, columnVectors)
-            rowCount += 1
+            cb.setNumRows(rowCount)
+            numInputRows += rowCount
+            numOutputBatches += 1
+            cb
           }
-          cb = new ColumnarBatch(columnVectors.toArray, rowCount)
-          numInputRows += rowCount
-          numOutputBatches += 1
-          cb
         }
+      } else {
+        Iterator.empty
       }
-    })
+    }
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): RowToColumnarExec =
+    copy(child = newChild)
 }
 
 /**
  * Apply any user defined [[ColumnarRule]]s and find the correct place to insert transitions
  * to/from columnar formatted data.
  */
-case class ApplyColumnarRulesAndInsertTransitions(conf: SQLConf, columnarRules: Seq[ColumnarRule])
+case class ApplyColumnarRulesAndInsertTransitions(
+    columnarRules: Seq[ColumnarRule])
   extends Rule[SparkPlan] {
 
   /**
@@ -498,8 +510,10 @@ case class ApplyColumnarRulesAndInsertTransitions(conf: SQLConf, columnarRules: 
       // The tree feels kind of backwards
       // Columnar Processing will start here, so transition from row to columnar
       RowToColumnarExec(insertTransitions(plan))
-    } else {
+    } else if (!plan.isInstanceOf[RowToColumnarTransition]) {
       plan.withNewChildren(plan.children.map(insertRowToColumnar))
+    } else {
+      plan
     }
   }
 
@@ -511,8 +525,10 @@ case class ApplyColumnarRulesAndInsertTransitions(conf: SQLConf, columnarRules: 
       // The tree feels kind of backwards
       // This is the end of the columnar processing so go back to rows
       ColumnarToRowExec(insertRowToColumnar(plan))
-    } else {
+    } else if (!plan.isInstanceOf[ColumnarToRowTransition]) {
       plan.withNewChildren(plan.children.map(insertTransitions))
+    } else {
+      plan
     }
   }
 

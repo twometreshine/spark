@@ -22,7 +22,6 @@ import java.lang.reflect.Modifier
 import scala.reflect.{classTag, ClassTag}
 import scala.reflect.runtime.universe.TypeTag
 
-import org.apache.spark.annotation.{Evolving, Experimental}
 import org.apache.spark.sql.catalyst.analysis.GetColumnByOrdinal
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, Cast}
@@ -30,13 +29,10 @@ import org.apache.spark.sql.catalyst.expressions.objects.{DecodeUsingSerializer,
 import org.apache.spark.sql.types._
 
 /**
- * :: Experimental ::
  * Methods for creating an [[Encoder]].
  *
  * @since 1.6.0
  */
-@Experimental
-@Evolving
 object Encoders {
 
   /**
@@ -140,6 +136,22 @@ object Encoders {
   def BINARY: Encoder[Array[Byte]] = ExpressionEncoder()
 
   /**
+   * Creates an encoder that serializes instances of the `java.time.Duration` class
+   * to the internal representation of nullable Catalyst's DayTimeIntervalType.
+   *
+   * @since 3.2.0
+   */
+  def DURATION: Encoder[java.time.Duration] = ExpressionEncoder()
+
+  /**
+   * Creates an encoder that serializes instances of the `java.time.Period` class
+   * to the internal representation of nullable Catalyst's YearMonthIntervalType.
+   *
+   * @since 3.2.0
+   */
+  def PERIOD: Encoder[java.time.Period] = ExpressionEncoder()
+
+  /**
    * Creates an encoder for Java Bean of type T.
    *
    * T must be publicly accessible.
@@ -150,7 +162,7 @@ object Encoders {
    *  - String
    *  - java.math.BigDecimal, java.math.BigInteger
    *  - time related: java.sql.Date, java.sql.Timestamp, java.time.LocalDate, java.time.Instant
-   *  - collection types: only array and java.util.List currently, map support is in progress
+   *  - collection types: array, java.util.List, and map
    *  - nested java bean.
    *
    * @since 1.6.0

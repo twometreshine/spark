@@ -22,9 +22,8 @@ import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, UnresolvedAlias, Un
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.plans.logical.sql.InsertIntoStatement
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{IntegerType, LongType, StringType}
 
 /**
  * Parser test cases for rules defined in [[CatalystSqlParser]] / [[AstBuilder]].
@@ -54,6 +53,109 @@ class PlanParserSuite extends AnalysisTest {
         name -> SubqueryAlias(name, subquery)
     }
     With(plan, ctes)
+  }
+
+  test("single comment case one") {
+    val plan = table("a").select(star())
+    assertEqual("-- single comment\nSELECT * FROM a", plan)
+  }
+
+  test("single comment case two") {
+    val plan = table("a").select(star())
+    assertEqual("-- single comment\\\nwith line continuity\nSELECT * FROM a", plan)
+  }
+
+  test("bracketed comment case one") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This is an example of SQL which should not execute:
+        | * select 'multi-line';
+        | */
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("bracketed comment case two") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*
+        |SELECT 'trailing' as x1; -- inside block comment
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case one") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This block comment surrounds a query which itself has a block comment...
+        |SELECT /* embedded single line */ 'embedded' AS x2;
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case two") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |SELECT -- continued after the following block comments...
+        |/* Deeply nested comment.
+        |   This includes a single apostrophe to make sure we aren't decoding this part as a string.
+        |SELECT 'deep nest' AS n1;
+        |/* Second level of nesting...
+        |SELECT 'deeper nest' as n2;
+        |/* Third level of nesting...
+        |SELECT 'deepest nest' as n3;
+        |*/
+        |Hoo boy. Still two deep...
+        |*/
+        |Now just one deep...
+        |*/
+        |* FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case three") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/* This block comment surrounds a query which itself has a block comment...
+        |//* I am a nested bracketed comment.
+        |*/
+        |*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case four") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/**/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case five") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/*abc*/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
+  }
+
+  test("nested bracketed comment case six") {
+    val plan = table("a").select(star())
+    assertEqual(
+      """
+        |/*/*foo*//*bar*/*/
+        |SELECT * FROM a
+      """.stripMargin, plan)
   }
 
   test("case insensitive") {
@@ -111,7 +213,7 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual("select a, b from db.c where x < 1", table("db", "c").where('x < 1).select('a, 'b))
     assertEqual(
       "select a, b from db.c having x < 1",
-      table("db", "c").groupBy()('a, 'b).where('x < 1))
+      table("db", "c").having()('a, 'b)('x < 1))
     assertEqual("select distinct a, b from db.c", Distinct(table("db", "c").select('a, 'b)))
     assertEqual("select all a, b from db.c", table("db", "c").select('a, 'b))
     assertEqual("select from tbl", OneRowRelation().select('from.as("tbl")))
@@ -193,7 +295,7 @@ class PlanParserSuite extends AnalysisTest {
         partition: Map[String, Option[String]],
         overwrite: Boolean = false,
         ifPartitionNotExists: Boolean = false): LogicalPlan =
-      InsertIntoStatement(table("s"), partition, plan, overwrite, ifPartitionNotExists)
+      InsertIntoStatement(table("s"), partition, Nil, plan, overwrite, ifPartitionNotExists)
 
     // Single inserts
     assertEqual(s"insert overwrite table s $sql",
@@ -213,22 +315,35 @@ class PlanParserSuite extends AnalysisTest {
 
   test("aggregation") {
     val sql = "select a, b, sum(c) as c from d group by a, b"
+    val sqlWithoutGroupBy = "select a, b, sum(c) as c from d"
 
     // Normal
     assertEqual(sql, table("d").groupBy('a, 'b)('a, 'b, 'sum.function('c).as("c")))
 
     // Cube
     assertEqual(s"$sql with cube",
-      table("d").groupBy(Cube(Seq('a, 'b)))('a, 'b, 'sum.function('c).as("c")))
+      table("d").groupBy(Cube(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
+    assertEqual(s"$sqlWithoutGroupBy group by cube(a, b)",
+      table("d").groupBy(Cube(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
+    assertEqual(s"$sqlWithoutGroupBy group by cube (a, b)",
+      table("d").groupBy(Cube(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
 
     // Rollup
     assertEqual(s"$sql with rollup",
-      table("d").groupBy(Rollup(Seq('a, 'b)))('a, 'b, 'sum.function('c).as("c")))
+      table("d").groupBy(Rollup(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
+    assertEqual(s"$sqlWithoutGroupBy group by rollup(a, b)",
+      table("d").groupBy(Rollup(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
+    assertEqual(s"$sqlWithoutGroupBy group by rollup (a, b)",
+      table("d").groupBy(Rollup(Seq(Seq('a), Seq('b))))('a, 'b, 'sum.function('c).as("c")))
 
     // Grouping Sets
     assertEqual(s"$sql grouping sets((a, b), (a), ())",
-      GroupingSets(Seq(Seq('a, 'b), Seq('a), Seq()), Seq('a, 'b), table("d"),
-        Seq('a, 'b, 'sum.function('c).as("c"))))
+      Aggregate(Seq(GroupingSets(Seq(Seq('a, 'b), Seq('a), Seq()), Seq('a, 'b))),
+        Seq('a, 'b, 'sum.function('c).as("c")), table("d")))
+
+    assertEqual(s"$sqlWithoutGroupBy group by grouping sets((a, b), (a), ())",
+      Aggregate(Seq(GroupingSets(Seq(Seq('a, 'b), Seq('a), Seq()))),
+        Seq('a, 'b, 'sum.function('c).as("c")), table("d")))
 
     val m = intercept[ParseException] {
       parsePlan("SELECT a, b, count(distinct a, distinct b) as c FROM d GROUP BY a, b")
@@ -477,8 +592,7 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "select g from t group by g having a > (select b from s)",
       table("t")
-        .groupBy('g)('g)
-        .where('a > ScalarSubquery(table("s").select('b))))
+        .having('g)('g)('a > ScalarSubquery(table("s").select('b))))
   }
 
   test("table reference") {
@@ -490,6 +604,9 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "select * from range(2)",
       UnresolvedTableValuedFunction("range", Literal(2) :: Nil, Seq.empty).select(star()))
+    // SPARK-34627
+    intercept("select * from default.range(2)",
+      "table valued function cannot specify database name: default.range")
   }
 
   test("SPARK-20311 range(N) as alias") {
@@ -506,20 +623,24 @@ class PlanParserSuite extends AnalysisTest {
   test("SPARK-20841 Support table column aliases in FROM clause") {
     assertEqual(
       "SELECT * FROM testData AS t(col1, col2)",
-      UnresolvedSubqueryColumnAliases(
-        Seq("col1", "col2"),
-        SubqueryAlias("t", UnresolvedRelation(TableIdentifier("testData")))
+      SubqueryAlias(
+        "t",
+        UnresolvedSubqueryColumnAliases(
+          Seq("col1", "col2"),
+          UnresolvedRelation(TableIdentifier("testData"))
+        )
       ).select(star()))
   }
 
   test("SPARK-20962 Support subquery column aliases in FROM clause") {
     assertEqual(
       "SELECT * FROM (SELECT a AS x, b AS y FROM t) t(col1, col2)",
-      UnresolvedSubqueryColumnAliases(
-        Seq("col1", "col2"),
-        SubqueryAlias(
-          "t",
-          UnresolvedRelation(TableIdentifier("t")).select('a.as("x"), 'b.as("y")))
+      SubqueryAlias(
+        "t",
+        UnresolvedSubqueryColumnAliases(
+          Seq("col1", "col2"),
+          UnresolvedRelation(TableIdentifier("t")).select('a.as("x"), 'b.as("y"))
+        )
       ).select(star()))
   }
 
@@ -528,12 +649,25 @@ class PlanParserSuite extends AnalysisTest {
     val src2 = UnresolvedRelation(TableIdentifier("src2")).as("s2")
     assertEqual(
       "SELECT * FROM (src1 s1 INNER JOIN src2 s2 ON s1.id = s2.id) dst(a, b, c, d)",
-      UnresolvedSubqueryColumnAliases(
-        Seq("a", "b", "c", "d"),
-        SubqueryAlias(
-          "dst",
-          src1.join(src2, Inner, Option(Symbol("s1.id") === Symbol("s2.id"))))
+      SubqueryAlias(
+        "dst",
+        UnresolvedSubqueryColumnAliases(
+          Seq("a", "b", "c", "d"),
+          src1.join(src2, Inner, Option(Symbol("s1.id") === Symbol("s2.id")))
+        )
       ).select(star()))
+  }
+
+  test("SPARK-34335 Support referencing subquery with column aliases by table alias") {
+    assertEqual(
+      "SELECT t.col1, t.col2 FROM (SELECT a AS x, b AS y FROM t) t(col1, col2)",
+      SubqueryAlias(
+        "t",
+        UnresolvedSubqueryColumnAliases(
+          Seq("col1", "col2"),
+          UnresolvedRelation(TableIdentifier("t")).select('a.as("x"), 'b.as("y")))
+      ).select($"t.col1", $"t.col2")
+    )
   }
 
   test("inline table") {
@@ -612,7 +746,7 @@ class PlanParserSuite extends AnalysisTest {
     comparePlans(
       parsePlan(
         "INSERT INTO s SELECT /*+ REPARTITION(100), COALESCE(500), COALESCE(10) */ * FROM t"),
-      InsertIntoStatement(table("s"), Map.empty,
+      InsertIntoStatement(table("s"), Map.empty, Nil,
         UnresolvedHint("REPARTITION", Seq(Literal(100)),
           UnresolvedHint("COALESCE", Seq(Literal(500)),
             UnresolvedHint("COALESCE", Seq(Literal(10)),
@@ -625,6 +759,52 @@ class PlanParserSuite extends AnalysisTest {
           table("t").select(star()))))
 
     intercept("SELECT /*+ COALESCE(30 + 50) */ * FROM t", "mismatched input")
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(c) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c), COALESCE(50) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("COALESCE", Seq(Literal(50)),
+          table("t").select(star()))))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50) */ * FROM t"),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("BROADCASTJOIN", Seq($"u"),
+          UnresolvedHint("COALESCE", Seq(Literal(50)),
+            table("t").select(star())))))
+
+    comparePlans(
+      parsePlan(
+        """
+          |SELECT
+          |/*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50), REPARTITION(300, c) */
+          |* FROM t
+        """.stripMargin),
+      UnresolvedHint("REPARTITION", Seq(Literal(100), UnresolvedAttribute("c")),
+        UnresolvedHint("BROADCASTJOIN", Seq($"u"),
+          UnresolvedHint("COALESCE", Seq(Literal(50)),
+            UnresolvedHint("REPARTITION", Seq(Literal(300), UnresolvedAttribute("c")),
+              table("t").select(star()))))))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION_BY_RANGE(c) */ * FROM t"),
+      UnresolvedHint("REPARTITION_BY_RANGE", Seq(UnresolvedAttribute("c")),
+        table("t").select(star())))
+
+    comparePlans(
+      parsePlan("SELECT /*+ REPARTITION_BY_RANGE(100, c) */ * FROM t"),
+      UnresolvedHint("REPARTITION_BY_RANGE", Seq(Literal(100), UnresolvedAttribute("c")),
+        table("t").select(star())))
   }
 
   test("SPARK-20854: select hint syntax with expressions") {
@@ -876,5 +1056,119 @@ class PlanParserSuite extends AnalysisTest {
     assertEqual(
       "WITH t(x) AS (SELECT c FROM a) SELECT * FROM t",
       cte(table("t").select(star()), "t" -> ((table("a").select('c), Seq("x")))))
+  }
+
+  test("statement containing terminal semicolons") {
+    assertEqual("select 1;", OneRowRelation().select(1))
+    assertEqual("select a, b;", OneRowRelation().select('a, 'b))
+    assertEqual("select a, b from db.c;;;", table("db", "c").select('a, 'b))
+    assertEqual("select a, b from db.c; ;;  ;", table("db", "c").select('a, 'b))
+  }
+
+  test("SPARK-32106: TRANSFORM plan") {
+    // verify schema less
+    assertEqual(
+      """
+        |SELECT TRANSFORM(a, b, c)
+        |USING 'cat'
+        |FROM testData
+      """.stripMargin,
+      ScriptTransformation(
+        "cat",
+        Seq(AttributeReference("key", StringType)(),
+          AttributeReference("value", StringType)()),
+        Project(Seq('a, 'b, 'c), UnresolvedRelation(TableIdentifier("testData"))),
+        ScriptInputOutputSchema(List.empty, List.empty, None, None,
+          List.empty, List.empty, None, None, true))
+    )
+
+    // verify without output schema
+    assertEqual(
+      """
+        |SELECT TRANSFORM(a, b, c)
+        |USING 'cat' AS (a, b, c)
+        |FROM testData
+      """.stripMargin,
+      ScriptTransformation(
+        "cat",
+        Seq(AttributeReference("a", StringType)(),
+          AttributeReference("b", StringType)(),
+          AttributeReference("c", StringType)()),
+        Project(Seq('a, 'b, 'c), UnresolvedRelation(TableIdentifier("testData"))),
+        ScriptInputOutputSchema(List.empty, List.empty, None, None,
+          List.empty, List.empty, None, None, false)))
+
+    // verify with output schema
+    assertEqual(
+      """
+        |SELECT TRANSFORM(a, b, c)
+        |USING 'cat' AS (a int, b string, c long)
+        |FROM testData
+      """.stripMargin,
+      ScriptTransformation(
+        "cat",
+        Seq(AttributeReference("a", IntegerType)(),
+          AttributeReference("b", StringType)(),
+          AttributeReference("c", LongType)()),
+        Project(Seq('a, 'b, 'c), UnresolvedRelation(TableIdentifier("testData"))),
+        ScriptInputOutputSchema(List.empty, List.empty, None, None,
+          List.empty, List.empty, None, None, false)))
+
+    // verify with ROW FORMAT DELIMETED
+    assertEqual(
+      """
+        |SELECT TRANSFORM(a, b, c)
+        |  ROW FORMAT DELIMITED
+        |  FIELDS TERMINATED BY '\t'
+        |  COLLECTION ITEMS TERMINATED BY '\u0002'
+        |  MAP KEYS TERMINATED BY '\u0003'
+        |  LINES TERMINATED BY '\n'
+        |  NULL DEFINED AS 'null'
+        |  USING 'cat' AS (a, b, c)
+        |  ROW FORMAT DELIMITED
+        |  FIELDS TERMINATED BY '\t'
+        |  COLLECTION ITEMS TERMINATED BY '\u0004'
+        |  MAP KEYS TERMINATED BY '\u0005'
+        |  LINES TERMINATED BY '\n'
+        |  NULL DEFINED AS 'NULL'
+        |FROM testData
+      """.stripMargin,
+      ScriptTransformation(
+        "cat",
+        Seq(AttributeReference("a", StringType)(),
+          AttributeReference("b", StringType)(),
+          AttributeReference("c", StringType)()),
+        Project(Seq('a, 'b, 'c), UnresolvedRelation(TableIdentifier("testData"))),
+        ScriptInputOutputSchema(
+          Seq(("TOK_TABLEROWFORMATFIELD", "\t"),
+            ("TOK_TABLEROWFORMATCOLLITEMS", "\u0002"),
+            ("TOK_TABLEROWFORMATMAPKEYS", "\u0003"),
+            ("TOK_TABLEROWFORMATNULL", "null"),
+            ("TOK_TABLEROWFORMATLINES", "\n")),
+          Seq(("TOK_TABLEROWFORMATFIELD", "\t"),
+            ("TOK_TABLEROWFORMATCOLLITEMS", "\u0004"),
+            ("TOK_TABLEROWFORMATMAPKEYS", "\u0005"),
+            ("TOK_TABLEROWFORMATNULL", "NULL"),
+            ("TOK_TABLEROWFORMATLINES", "\n")), None, None,
+          List.empty, List.empty, None, None, false)))
+
+    // verify with ROW FORMAT SERDE
+    intercept(
+      """
+        |SELECT TRANSFORM(a, b, c)
+        |  ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+        |  WITH SERDEPROPERTIES(
+        |    "separatorChar" = "\t",
+        |    "quoteChar" = "'",
+        |    "escapeChar" = "\\")
+        |  USING 'cat' AS (a, b, c)
+        |  ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+        |  WITH SERDEPROPERTIES(
+        |    "separatorChar" = "\t",
+        |    "quoteChar" = "'",
+        |    "escapeChar" = "\\")
+        |FROM testData
+      """.stripMargin,
+      "TRANSFORM with serde is only supported in hive mode")
   }
 }

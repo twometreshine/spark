@@ -6,12 +6,20 @@ title: Spark on Kubernetes Integration Tests
 # Running the Kubernetes Integration Tests
 
 Note that the integration test framework is currently being heavily revised and
-is subject to change. Note that currently the integration tests only run with Java 8.
+is subject to change.
 
 The simplest way to run the integration tests is to install and run Minikube, then run the following from this
 directory:
 
     ./dev/dev-run-integration-tests.sh
+
+To run tests with Java 11 instead of Java 8, use `--java-image-tag` to specify the base image.
+
+    ./dev/dev-run-integration-tests.sh --java-image-tag 11-jre-slim
+
+To run tests with Hadoop 2.7 instead of Hadoop 3.2, use `--hadoop-profile`.
+
+    ./dev/dev-run-integration-tests.sh --hadoop-profile hadoop-2.7
 
 The minimum tested version of Minikube is 0.23.0. The kube-dns addon must be enabled. Minikube should
 run with a minimum of 4 CPUs and 6G of memory:
@@ -118,7 +126,7 @@ If you prefer to run just the integration tests directly, then you can customise
 properties to Maven.  For example:
 
     mvn integration-test -am -pl :spark-kubernetes-integration-tests_2.12 \
-                            -Pkubernetes -Pkubernetes-integration-tests \ 
+                            -Pkubernetes -Pkubernetes-integration-tests \
                             -Phadoop-2.7 -Dhadoop.version=2.7.4 \
                             -Dspark.kubernetes.test.sparkTgz=spark-3.0.0-SNAPSHOT-bin-example.tgz \
                             -Dspark.kubernetes.test.imageTag=sometag \
@@ -183,7 +191,14 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
       A specific image tag to use, when set assumes images with those tags are already built and available in the 
       specified image repository.  When set to <code>N/A</code> (the default) fresh images will be built.
     </td>
-    <td><code>N/A</code>
+    <td><code>N/A</code></td>
+  </tr>
+  <tr>
+    <td><code>spark.kubernetes.test.javaImageTag</code></td>
+    <td>
+      A specific OpenJDK base image tag to use, when set uses it instead of 8-jre-slim.
+    </td>
+    <td><code>8-jre-slim</code></td>
   </tr>
   <tr>
     <td><code>spark.kubernetes.test.imageTagFile</code></td>

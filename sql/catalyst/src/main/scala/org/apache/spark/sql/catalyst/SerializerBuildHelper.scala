@@ -19,14 +19,14 @@ package org.apache.spark.sql.catalyst
 
 import org.apache.spark.sql.catalyst.expressions.{CheckOverflow, CreateNamedStruct, Expression, IsNull, UnsafeArrayData}
 import org.apache.spark.sql.catalyst.expressions.objects._
-import org.apache.spark.sql.catalyst.util.{DateTimeUtils, GenericArrayData}
+import org.apache.spark.sql.catalyst.util.{DateTimeUtils, GenericArrayData, IntervalUtils}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
 object SerializerBuildHelper {
 
-  private def nullOnOverflow: Boolean = SQLConf.get.decimalOperationsNullOnOverflow
+  private def nullOnOverflow: Boolean = !SQLConf.get.ansiEnabled
 
   def createSerializerForBoolean(inputObject: Expression): Expression = {
     Invoke(inputObject, "booleanValue", BooleanType)
@@ -74,6 +74,9 @@ object SerializerBuildHelper {
       returnNullable = false)
   }
 
+  def createSerializerForJavaEnum(inputObject: Expression): Expression =
+    createSerializerForString(Invoke(inputObject, "name", ObjectType(classOf[String])))
+
   def createSerializerForSqlTimestamp(inputObject: Expression): Expression = {
     StaticInvoke(
       DateTimeUtils.getClass,
@@ -97,6 +100,24 @@ object SerializerBuildHelper {
       DateTimeUtils.getClass,
       DateType,
       "fromJavaDate",
+      inputObject :: Nil,
+      returnNullable = false)
+  }
+
+  def createSerializerForJavaDuration(inputObject: Expression): Expression = {
+    StaticInvoke(
+      IntervalUtils.getClass,
+      DayTimeIntervalType,
+      "durationToMicros",
+      inputObject :: Nil,
+      returnNullable = false)
+  }
+
+  def createSerializerForJavaPeriod(inputObject: Expression): Expression = {
+    StaticInvoke(
+      IntervalUtils.getClass,
+      YearMonthIntervalType,
+      "periodToMonths",
       inputObject :: Nil,
       returnNullable = false)
   }
@@ -187,8 +208,12 @@ object SerializerBuildHelper {
     val nonNullOutput = CreateNamedStruct(fields.flatMap { case(fieldName, fieldExpr) =>
       argumentsForFieldSerializer(fieldName, fieldExpr)
     })
-    val nullOutput = expressions.Literal.create(null, nonNullOutput.dataType)
-    expressions.If(IsNull(inputObject), nullOutput, nonNullOutput)
+    if (inputObject.nullable) {
+      val nullOutput = expressions.Literal.create(null, nonNullOutput.dataType)
+      expressions.If(IsNull(inputObject), nullOutput, nonNullOutput)
+    } else {
+      nonNullOutput
+    }
   }
 
   def createSerializerForUserDefinedType(

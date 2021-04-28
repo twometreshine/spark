@@ -29,7 +29,7 @@ object PlanHelper {
   /**
    * Check if there's any expression in this query plan operator that is
    * - A WindowExpression but the plan is not Window
-   * - An AggregateExpresion but the plan is not Aggregate or Window
+   * - An AggregateExpression but the plan is not Aggregate or Window
    * - A Generator but the plan is not Generate
    * Returns the list of invalid expressions that this operator hosts. This can happen when
    * 1. The input query from users contain invalid expressions.
@@ -43,7 +43,9 @@ object PlanHelper {
         case e: WindowExpression
           if !plan.isInstanceOf[Window] => e
         case e: AggregateExpression
-          if !(plan.isInstanceOf[Aggregate] || plan.isInstanceOf[Window]) => e
+          if !(plan.isInstanceOf[Aggregate] ||
+               plan.isInstanceOf[Window] ||
+               plan.isInstanceOf[CollectMetrics]) => e
         case e: Generator
           if !plan.isInstanceOf[Generate] => e
       }

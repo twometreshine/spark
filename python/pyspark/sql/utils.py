@@ -17,6 +17,8 @@
 
 import py4j
 
+from pyspark import SparkContext
+
 
 class CapturedException(Exception):
     def __init__(self, desc, stackTrace, cause=None):
@@ -25,7 +27,12 @@ class CapturedException(Exception):
         self.cause = convert_exception(cause) if cause is not None else None
 
     def __str__(self):
-        return repr(self.desc)
+        sql_conf = SparkContext._jvm.org.apache.spark.sql.internal.SQLConf.get()
+        debug_enabled = sql_conf.pysparkJVMStacktraceEnabled()
+        desc = self.desc
+        if debug_enabled:
+            desc = desc + "\n\nJVM stacktrace:\n%s" % self.stackTrace
+        return str(desc)
 
 
 class AnalysisException(CapturedException):
@@ -58,6 +65,12 @@ class QueryExecutionException(CapturedException):
     """
 
 
+class PythonException(CapturedException):
+    """
+    Exceptions thrown from Python workers.
+    """
+
+
 class UnknownException(CapturedException):
     """
     None of the above exceptions.
@@ -66,21 +79,30 @@ class UnknownException(CapturedException):
 
 def convert_exception(e):
     s = e.toString()
-    stackTrace = '\n\t at '.join(map(lambda x: x.toString(), e.getStackTrace()))
     c = e.getCause()
+    stacktrace = SparkContext._jvm.org.apache.spark.util.Utils.exceptionString(e)
+
     if s.startswith('org.apache.spark.sql.AnalysisException: '):
-        return AnalysisException(s.split(': ', 1)[1], stackTrace, c)
+        return AnalysisException(s.split(': ', 1)[1], stacktrace, c)
     if s.startswith('org.apache.spark.sql.catalyst.analysis'):
-        return AnalysisException(s.split(': ', 1)[1], stackTrace, c)
+        return AnalysisException(s.split(': ', 1)[1], stacktrace, c)
     if s.startswith('org.apache.spark.sql.catalyst.parser.ParseException: '):
-        return ParseException(s.split(': ', 1)[1], stackTrace, c)
+        return ParseException(s.split(': ', 1)[1], stacktrace, c)
     if s.startswith('org.apache.spark.sql.streaming.StreamingQueryException: '):
-        return StreamingQueryException(s.split(': ', 1)[1], stackTrace, c)
+        return StreamingQueryException(s.split(': ', 1)[1], stacktrace, c)
     if s.startswith('org.apache.spark.sql.execution.QueryExecutionException: '):
-        return QueryExecutionException(s.split(': ', 1)[1], stackTrace, c)
+        return QueryExecutionException(s.split(': ', 1)[1], stacktrace, c)
     if s.startswith('java.lang.IllegalArgumentException: '):
-        return IllegalArgumentException(s.split(': ', 1)[1], stackTrace, c)
-    return UnknownException(s, stackTrace, c)
+        return IllegalArgumentException(s.split(': ', 1)[1], stacktrace, c)
+    if c is not None and (
+            c.toString().startswith('org.apache.spark.api.python.PythonException: ')
+            # To make sure this only catches Python UDFs.
+            and any(map(lambda v: "org.apache.spark.sql.execution.python" in v.toString(),
+                        c.getStackTrace()))):
+        msg = ("\n  An exception was thrown from the Python worker. "
+               "Please see the stack trace below.\n%s" % c.getMessage())
+        return PythonException(msg, stacktrace)
+    return UnknownException(s, stacktrace, c)
 
 
 def capture_sql_exception(f):
@@ -90,7 +112,9 @@ def capture_sql_exception(f):
         except py4j.protocol.Py4JJavaError as e:
             converted = convert_exception(e.java_exception)
             if not isinstance(converted, UnknownException):
-                raise converted
+                # Hide where the exception came from that shows a non-Pythonic
+                # JVM exception message.
+                raise converted from None
             else:
                 raise
     return deco
@@ -117,54 +141,20 @@ def install_exception_handler():
 def toJArray(gateway, jtype, arr):
     """
     Convert python list to java type array
-    :param gateway: Py4j Gateway
-    :param jtype: java type of element in array
-    :param arr: python type list
+
+    Parameters
+    ----------
+    gateway :
+        Py4j Gateway
+    jtype :
+        java type of element in array
+    arr :
+        python type list
     """
-    jarr = gateway.new_array(jtype, len(arr))
+    jarray = gateway.new_array(jtype, len(arr))
     for i in range(0, len(arr)):
-        jarr[i] = arr[i]
-    return jarr
-
-
-def require_minimum_pandas_version():
-    """ Raise ImportError if minimum version of Pandas is not installed
-    """
-    # TODO(HyukjinKwon): Relocate and deduplicate the version specification.
-    minimum_pandas_version = "0.23.2"
-
-    from distutils.version import LooseVersion
-    try:
-        import pandas
-        have_pandas = True
-    except ImportError:
-        have_pandas = False
-    if not have_pandas:
-        raise ImportError("Pandas >= %s must be installed; however, "
-                          "it was not found." % minimum_pandas_version)
-    if LooseVersion(pandas.__version__) < LooseVersion(minimum_pandas_version):
-        raise ImportError("Pandas >= %s must be installed; however, "
-                          "your version was %s." % (minimum_pandas_version, pandas.__version__))
-
-
-def require_minimum_pyarrow_version():
-    """ Raise ImportError if minimum version of pyarrow is not installed
-    """
-    # TODO(HyukjinKwon): Relocate and deduplicate the version specification.
-    minimum_pyarrow_version = "0.12.1"
-
-    from distutils.version import LooseVersion
-    try:
-        import pyarrow
-        have_arrow = True
-    except ImportError:
-        have_arrow = False
-    if not have_arrow:
-        raise ImportError("PyArrow >= %s must be installed; however, "
-                          "it was not found." % minimum_pyarrow_version)
-    if LooseVersion(pyarrow.__version__) < LooseVersion(minimum_pyarrow_version):
-        raise ImportError("PyArrow >= %s must be installed; however, "
-                          "your version was %s." % (minimum_pyarrow_version, pyarrow.__version__))
+        jarray[i] = arr[i]
+    return jarray
 
 
 def require_test_compiled():

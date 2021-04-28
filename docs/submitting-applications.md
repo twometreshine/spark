@@ -76,7 +76,7 @@ locally on your laptop), it is common to use `cluster` mode to minimize network 
 the drivers and the executors. Currently, the standalone mode does not support cluster mode for Python
 applications.
 
-For Python applications, simply pass a `.py` file in the place of `<application-jar>` instead of a JAR,
+For Python applications, simply pass a `.py` file in the place of `<application-jar>`,
 and add Python `.zip`, `.egg` or `.py` files to the search path with `--py-files`.
 
 There are a few options available that are specific to the
@@ -182,7 +182,7 @@ The master URL passed to Spark can be in one of the following formats:
 </td></tr>
 <tr><td> <code>k8s://HOST:PORT</code> </td><td> Connect to a <a href="running-on-kubernetes.html">Kubernetes</a> cluster in
         <code>cluster</code> mode. Client mode is currently unsupported and will be supported in future releases.
-        The <code>HOST</code> and <code>PORT</code> refer to the [Kubernetes API Server](https://kubernetes.io/docs/reference/generated/kube-apiserver/).
+        The <code>HOST</code> and <code>PORT</code> refer to the <a href="https://kubernetes.io/docs/reference/generated/kube-apiserver/">Kubernetes API Server</a>.
         It connects using TLS by default. In order to force it to use an unsecured connection, you can use
         <code>k8s://http://HOST:PORT</code>.
 </td></tr>

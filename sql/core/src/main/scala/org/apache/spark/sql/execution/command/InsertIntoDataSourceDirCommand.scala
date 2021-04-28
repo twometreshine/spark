@@ -36,15 +36,15 @@ import org.apache.spark.sql.execution.datasources._
  * @param storage storage format used to describe how the query result is stored.
  * @param provider the data source type to be used
  * @param query the logical plan representing data to write to
- * @param overwrite whthere overwrites existing directory
+ * @param overwrite whether overwrites existing directory
  */
 case class InsertIntoDataSourceDirCommand(
     storage: CatalogStorageFormat,
     provider: String,
     query: LogicalPlan,
-    overwrite: Boolean) extends RunnableCommand {
+    overwrite: Boolean) extends LeafRunnableCommand {
 
-  override protected def innerChildren: Seq[LogicalPlan] = query :: Nil
+  override def innerChildren: Seq[LogicalPlan] = query :: Nil
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     assert(storage.locationUri.nonEmpty, "Directory path is required")

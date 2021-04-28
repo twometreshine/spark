@@ -17,14 +17,17 @@
 
 package org.apache.spark.sql.types
 
-import scala.math.Numeric.{ByteIsIntegral, IntIsIntegral, LongIsIntegral, ShortIsIntegral}
+import scala.math.Numeric._
 import scala.math.Ordering
 
+import org.apache.spark.sql.catalyst.util.SQLOrderingUtil
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.types.Decimal.DecimalIsConflicted
 
-object ByteExactNumeric extends ByteIsIntegral with Ordering.ByteOrdering {
+private[sql] object ByteExactNumeric extends ByteIsIntegral with Ordering.ByteOrdering {
   private def checkOverflow(res: Int, x: Byte, y: Byte, op: String): Unit = {
     if (res > Byte.MaxValue || res < Byte.MinValue) {
-      throw new ArithmeticException(s"$x $op $y caused overflow.")
+      throw QueryExecutionErrors.binaryArithmeticCauseOverflowError(x, op, y)
     }
   }
 
@@ -48,17 +51,17 @@ object ByteExactNumeric extends ByteIsIntegral with Ordering.ByteOrdering {
 
   override def negate(x: Byte): Byte = {
     if (x == Byte.MinValue) { // if and only if x is Byte.MinValue, overflow can happen
-      throw new ArithmeticException(s"- $x caused overflow.")
+      throw QueryExecutionErrors.unaryMinusCauseOverflowError(x)
     }
     (-x).toByte
   }
 }
 
 
-object ShortExactNumeric extends ShortIsIntegral with Ordering.ShortOrdering {
+private[sql] object ShortExactNumeric extends ShortIsIntegral with Ordering.ShortOrdering {
   private def checkOverflow(res: Int, x: Short, y: Short, op: String): Unit = {
     if (res > Short.MaxValue || res < Short.MinValue) {
-      throw new ArithmeticException(s"$x $op $y caused overflow.")
+      throw QueryExecutionErrors.binaryArithmeticCauseOverflowError(x, op, y)
     }
   }
 
@@ -82,14 +85,14 @@ object ShortExactNumeric extends ShortIsIntegral with Ordering.ShortOrdering {
 
   override def negate(x: Short): Short = {
     if (x == Short.MinValue) { // if and only if x is Byte.MinValue, overflow can happen
-      throw new ArithmeticException(s"- $x caused overflow.")
+      throw QueryExecutionErrors.unaryMinusCauseOverflowError(x)
     }
     (-x).toShort
   }
 }
 
 
-object IntegerExactNumeric extends IntIsIntegral with Ordering.IntOrdering {
+private[sql] object IntegerExactNumeric extends IntIsIntegral with Ordering.IntOrdering {
   override def plus(x: Int, y: Int): Int = Math.addExact(x, y)
 
   override def minus(x: Int, y: Int): Int = Math.subtractExact(x, y)
@@ -99,7 +102,7 @@ object IntegerExactNumeric extends IntIsIntegral with Ordering.IntOrdering {
   override def negate(x: Int): Int = Math.negateExact(x)
 }
 
-object LongExactNumeric extends LongIsIntegral with Ordering.LongOrdering {
+private[sql] object LongExactNumeric extends LongIsIntegral with Ordering.LongOrdering {
   override def plus(x: Long, y: Long): Long = Math.addExact(x, y)
 
   override def minus(x: Long, y: Long): Long = Math.subtractExact(x, y)
@@ -107,4 +110,73 @@ object LongExactNumeric extends LongIsIntegral with Ordering.LongOrdering {
   override def times(x: Long, y: Long): Long = Math.multiplyExact(x, y)
 
   override def negate(x: Long): Long = Math.negateExact(x)
+
+  override def toInt(x: Long): Int =
+    if (x == x.toInt) {
+      x.toInt
+    } else {
+      throw QueryExecutionErrors.castingCauseOverflowError(x, "int")
+    }
+}
+
+private[sql] object FloatExactNumeric extends FloatIsFractional {
+  private val intUpperBound = Int.MaxValue
+  private val intLowerBound = Int.MinValue
+  private val longUpperBound = Long.MaxValue
+  private val longLowerBound = Long.MinValue
+
+  override def toInt(x: Float): Int = {
+    // When casting floating values to integral types, Spark uses the method `Numeric.toInt`
+    // Or `Numeric.toLong` directly. For positive floating values, it is equivalent to `Math.floor`;
+    // for negative floating values, it is equivalent to `Math.ceil`.
+    // So, we can use the condition `Math.floor(x) <= upperBound && Math.ceil(x) >= lowerBound`
+    // to check if the floating value x is in the range of an integral type after rounding.
+    // This condition applies to converting Float/Double value to any integral types.
+    if (Math.floor(x) <= intUpperBound && Math.ceil(x) >= intLowerBound) {
+      x.toInt
+    } else {
+      throw QueryExecutionErrors.castingCauseOverflowError(x, "int")
+    }
+  }
+
+  override def toLong(x: Float): Long = {
+    if (Math.floor(x) <= longUpperBound && Math.ceil(x) >= longLowerBound) {
+      x.toLong
+    } else {
+      throw QueryExecutionErrors.castingCauseOverflowError(x, "int")
+    }
+  }
+
+  override def compare(x: Float, y: Float): Int = SQLOrderingUtil.compareFloats(x, y)
+}
+
+private[sql] object DoubleExactNumeric extends DoubleIsFractional {
+  private val intUpperBound = Int.MaxValue
+  private val intLowerBound = Int.MinValue
+  private val longUpperBound = Long.MaxValue
+  private val longLowerBound = Long.MinValue
+
+  override def toInt(x: Double): Int = {
+    if (Math.floor(x) <= intUpperBound && Math.ceil(x) >= intLowerBound) {
+      x.toInt
+    } else {
+      throw QueryExecutionErrors.castingCauseOverflowError(x, "int")
+    }
+  }
+
+  override def toLong(x: Double): Long = {
+    if (Math.floor(x) <= longUpperBound && Math.ceil(x) >= longLowerBound) {
+      x.toLong
+    } else {
+      throw QueryExecutionErrors.castingCauseOverflowError(x, "long")
+    }
+  }
+
+  override def compare(x: Double, y: Double): Int = SQLOrderingUtil.compareDoubles(x, y)
+}
+
+private[sql] object DecimalExactNumeric extends DecimalIsConflicted {
+  override def toInt(x: Decimal): Int = x.roundToInt()
+
+  override def toLong(x: Decimal): Long = x.roundToLong()
 }

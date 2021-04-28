@@ -24,7 +24,6 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.objects._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType, UserDefinedType}
 
 /*
@@ -147,7 +146,7 @@ object ObjectSerializerPruning extends Rule[LogicalPlan] {
    */
   private def pruneNamedStruct(struct: CreateNamedStruct, prunedType: StructType) = {
     // Filters out the pruned fields.
-    val resolver = SQLConf.get.resolver
+    val resolver = conf.resolver
     val prunedFields = struct.nameExprs.zip(struct.valExprs).filter { case (nameExpr, _) =>
       val name = nameExpr.eval(EmptyRow).toString
       prunedType.fieldNames.exists(resolver(_, name))
@@ -162,8 +161,16 @@ object ObjectSerializerPruning extends Rule[LogicalPlan] {
    * Note: we should do `transformUp` explicitly to change data types.
    */
   private def alignNullTypeInIf(expr: Expression) = expr.transformUp {
-    case i @ If(_: IsNull, Literal(null, dt), ser) if !dt.sameType(ser.dataType) =>
+    case i @ If(IsNullCondition(), Literal(null, dt), ser) if !dt.sameType(ser.dataType) =>
       i.copy(trueValue = Literal(null, ser.dataType))
+  }
+
+  object IsNullCondition {
+    def unapply(expr: Expression): Boolean = expr match {
+      case _: IsNull => true
+      case i: Invoke if i.functionName == "isNullAt" => true
+      case _ => false
+    }
   }
 
   /**
@@ -208,7 +215,7 @@ object ObjectSerializerPruning extends Rule[LogicalPlan] {
 
       val rootFields = SchemaPruning.identifyRootFields(p.projectList, Seq.empty)
 
-      if (SQLConf.get.serializerNestedSchemaPruningEnabled && rootFields.nonEmpty) {
+      if (conf.serializerNestedSchemaPruningEnabled && rootFields.nonEmpty) {
         // Prunes nested fields in serializers.
         val prunedSchema = SchemaPruning.pruneDataSchema(
           StructType.fromAttributes(prunedSerializer.map(_.toAttribute)), rootFields)
@@ -235,8 +242,6 @@ object ObjectSerializerPruning extends Rule[LogicalPlan] {
  */
 object ReassignLambdaVariableID extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    if (!SQLConf.get.getConf(SQLConf.OPTIMIZER_REASSIGN_LAMBDA_VARIABLE_ID)) return plan
-
     // The original LambdaVariable IDs are all positive. To avoid conflicts, the new IDs are all
     // negative and starts from -1.
     var newId = 0L

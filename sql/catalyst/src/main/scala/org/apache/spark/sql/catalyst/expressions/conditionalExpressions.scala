@@ -21,6 +21,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion}
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.trees.TernaryLike
+import org.apache.spark.sql.catalyst.trees.TreePattern.{CASE_WHEN, IF, TreePattern}
 import org.apache.spark.sql.types._
 
 // scalastyle:off line.size.limit
@@ -30,18 +32,24 @@ import org.apache.spark.sql.types._
     Examples:
       > SELECT _FUNC_(1 < 2, 'a', 'b');
        a
-  """)
+  """,
+  since = "1.0.0",
+  group = "conditional_funcs")
 // scalastyle:on line.size.limit
 case class If(predicate: Expression, trueValue: Expression, falseValue: Expression)
-  extends ComplexTypeMergingExpression {
+  extends ComplexTypeMergingExpression with TernaryLike[Expression] {
 
   @transient
   override lazy val inputTypesForMerging: Seq[DataType] = {
     Seq(trueValue.dataType, falseValue.dataType)
   }
 
-  override def children: Seq[Expression] = predicate :: trueValue :: falseValue :: Nil
+  override def first: Expression = predicate
+  override def second: Expression = trueValue
+  override def third: Expression = falseValue
   override def nullable: Boolean = trueValue.nullable || falseValue.nullable
+
+  final override val nodePatterns : Seq[TreePattern] = Seq(IF)
 
   override def checkInputDataTypes(): TypeCheckResult = {
     if (predicate.dataType != BooleanType) {
@@ -90,6 +98,13 @@ case class If(predicate: Expression, trueValue: Expression, falseValue: Expressi
   override def toString: String = s"if ($predicate) $trueValue else $falseValue"
 
   override def sql: String = s"(IF(${predicate.sql}, ${trueValue.sql}, ${falseValue.sql}))"
+
+  override protected def withNewChildrenInternal(
+      newFirst: Expression, newSecond: Expression, newThird: Expression): Expression = copy(
+    predicate = newFirst,
+    trueValue = newSecond,
+    falseValue = newThird
+  )
 }
 
 /**
@@ -111,12 +126,14 @@ case class If(predicate: Expression, trueValue: Expression, falseValue: Expressi
   examples = """
     Examples:
       > SELECT CASE WHEN 1 > 0 THEN 1 WHEN 2 > 0 THEN 2.0 ELSE 1.2 END;
-       1
+       1.0
       > SELECT CASE WHEN 1 < 0 THEN 1 WHEN 2 > 0 THEN 2.0 ELSE 1.2 END;
-       2
+       2.0
       > SELECT CASE WHEN 1 < 0 THEN 1 WHEN 2 < 0 THEN 2.0 END;
        NULL
-  """)
+  """,
+  since = "1.0.1",
+  group = "conditional_funcs")
 // scalastyle:on line.size.limit
 case class CaseWhen(
     branches: Seq[(Expression, Expression)],
@@ -124,6 +141,11 @@ case class CaseWhen(
   extends ComplexTypeMergingExpression with Serializable {
 
   override def children: Seq[Expression] = branches.flatMap(b => b._1 :: b._2 :: Nil) ++ elseValue
+
+  final override val nodePatterns : Seq[TreePattern] = Seq(CASE_WHEN)
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    super.legacyWithNewChildren(newChildren)
 
   // both then and else expressions should be considered.
   @transient
@@ -185,7 +207,7 @@ case class CaseWhen(
     "CASE" + cases + elseCase + " END"
   }
 
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+  private def multiBranchesCodegen(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     // This variable holds the state of the result:
     // -1 means the condition is not met yet and the result is unknown.
     val NOT_MATCHED = -1
@@ -278,6 +300,18 @@ case class CaseWhen(
          |// TRUE if any condition is met and the result is null, or no any condition is met.
          |final boolean ${ev.isNull} = ($resultState != $HAS_NONNULL);
        """.stripMargin)
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    if (branches.length == 1) {
+      // If we have only single branch we can use If expression and its codeGen
+      If(
+        branches(0)._1,
+        branches(0)._2,
+        elseValue.getOrElse(Literal.create(null, branches(0)._2.dataType))).doGenCode(ctx, ev)
+    } else {
+      multiBranchesCodegen(ctx, ev)
+    }
   }
 }
 

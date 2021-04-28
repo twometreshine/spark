@@ -53,6 +53,9 @@ import org.apache.spark.sql.types._
  *   TimestampType -> java.sql.Timestamp if spark.sql.datetime.java8API.enabled is false
  *   TimestampType -> java.time.Instant if spark.sql.datetime.java8API.enabled is true
  *
+ *   DayTimeIntervalType -> java.time.Duration
+ *   YearMonthIntervalType -> java.time.Period
+ *
  *   BinaryType -> byte array
  *   ArrayType -> scala.collection.Seq or Array
  *   MapType -> scala.collection.Map
@@ -108,13 +111,17 @@ object RowEncoder {
         createSerializerForSqlDate(inputObject)
       }
 
+    case DayTimeIntervalType => createSerializerForJavaDuration(inputObject)
+
+    case YearMonthIntervalType => createSerializerForJavaPeriod(inputObject)
+
     case d: DecimalType =>
       CheckOverflow(StaticInvoke(
         Decimal.getClass,
         d,
         "fromDecimal",
         inputObject :: Nil,
-        returnNullable = false), d, SQLConf.get.decimalOperationsNullOnOverflow)
+        returnNullable = false), d, !SQLConf.get.ansiEnabled)
 
     case StringType => createSerializerForString(inputObject)
 
@@ -226,6 +233,8 @@ object RowEncoder {
       } else {
         ObjectType(classOf[java.sql.Date])
       }
+    case DayTimeIntervalType => ObjectType(classOf[java.time.Duration])
+    case YearMonthIntervalType => ObjectType(classOf[java.time.Period])
     case _: DecimalType => ObjectType(classOf[java.math.BigDecimal])
     case StringType => ObjectType(classOf[java.lang.String])
     case _: ArrayType => ObjectType(classOf[scala.collection.Seq[_]])
@@ -281,6 +290,10 @@ object RowEncoder {
         createDeserializerForSqlDate(input)
       }
 
+    case DayTimeIntervalType => createDeserializerForDuration(input)
+
+    case YearMonthIntervalType => createDeserializerForPeriod(input)
+
     case _: DecimalType => createDeserializerForJavaBigDecimal(input, returnNullable = false)
 
     case StringType => createDeserializerForString(input, returnNullable = false)
@@ -291,9 +304,11 @@ object RowEncoder {
           MapObjects(deserializerFor(_), input, et),
           "array",
           ObjectType(classOf[Array[_]]), returnNullable = false)
+      // TODO should use `scala.collection.immutable.ArrayDeq.unsafeMake` method to create
+      //  `immutable.Seq` in Scala 2.13 when Scala version compatibility is no longer required.
       StaticInvoke(
         scala.collection.mutable.WrappedArray.getClass,
-        ObjectType(classOf[Seq[_]]),
+        ObjectType(classOf[scala.collection.Seq[_]]),
         "make",
         arrayData :: Nil,
         returnNullable = false)

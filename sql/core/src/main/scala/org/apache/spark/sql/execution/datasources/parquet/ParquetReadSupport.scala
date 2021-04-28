@@ -17,7 +17,8 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
-import java.util.{Locale, Map => JMap, TimeZone}
+import java.time.ZoneId
+import java.util.{Locale, Map => JMap}
 
 import scala.collection.JavaConverters._
 
@@ -29,13 +30,15 @@ import org.apache.parquet.schema._
 import org.apache.parquet.schema.Type.Repetition
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 import org.apache.spark.sql.types._
 
 /**
  * A Parquet [[ReadSupport]] implementation for reading Parquet records as Catalyst
- * [[UnsafeRow]]s.
+ * [[InternalRow]]s.
  *
  * The API interface of [[ReadSupport]] is a little bit over complicated because of historical
  * reasons.  In older versions of parquet-mr (say 1.6.0rc3 and prior), [[ReadSupport]] need to be
@@ -49,16 +52,23 @@ import org.apache.spark.sql.types._
  * Due to this reason, we no longer rely on [[ReadContext]] to pass requested schema from [[init()]]
  * to [[prepareForRead()]], but use a private `var` for simplicity.
  */
-class ParquetReadSupport(val convertTz: Option[TimeZone],
-    enableVectorizedReader: Boolean)
-  extends ReadSupport[UnsafeRow] with Logging {
+class ParquetReadSupport(
+    val convertTz: Option[ZoneId],
+    enableVectorizedReader: Boolean,
+    datetimeRebaseMode: LegacyBehaviorPolicy.Value,
+    int96RebaseMode: LegacyBehaviorPolicy.Value)
+  extends ReadSupport[InternalRow] with Logging {
   private var catalystRequestedSchema: StructType = _
 
-  def this() {
+  def this() = {
     // We need a zero-arg constructor for SpecificParquetRecordReaderBase.  But that is only
-    // used in the vectorized reader, where we get the convertTz value directly, and the value here
-    // is ignored.
-    this(None, enableVectorizedReader = true)
+    // used in the vectorized reader, where we get the convertTz/rebaseDateTime value directly,
+    // and the values here are ignored.
+    this(
+      None,
+      enableVectorizedReader = true,
+      datetimeRebaseMode = LegacyBehaviorPolicy.CORRECTED,
+      int96RebaseMode = LegacyBehaviorPolicy.LEGACY)
   }
 
   /**
@@ -114,19 +124,21 @@ class ParquetReadSupport(val convertTz: Option[TimeZone],
   /**
    * Called on executor side after [[init()]], before instantiating actual Parquet record readers.
    * Responsible for instantiating [[RecordMaterializer]], which is used for converting Parquet
-   * records to Catalyst [[UnsafeRow]]s.
+   * records to Catalyst [[InternalRow]]s.
    */
   override def prepareForRead(
       conf: Configuration,
       keyValueMetaData: JMap[String, String],
       fileSchema: MessageType,
-      readContext: ReadContext): RecordMaterializer[UnsafeRow] = {
+      readContext: ReadContext): RecordMaterializer[InternalRow] = {
     val parquetRequestedSchema = readContext.getRequestedSchema
     new ParquetRecordMaterializer(
       parquetRequestedSchema,
       ParquetReadSupport.expandUDT(catalystRequestedSchema),
       new ParquetToSparkSchemaConverter(conf),
-      convertTz)
+      convertTz,
+      datetimeRebaseMode,
+      int96RebaseMode)
   }
 }
 
@@ -331,8 +343,8 @@ object ParquetReadSupport {
             if (parquetTypes.size > 1) {
               // Need to fail if there is ambiguity, i.e. more than one field is matched
               val parquetTypesString = parquetTypes.map(_.getName).mkString("[", ", ", "]")
-              throw new RuntimeException(s"""Found duplicate field(s) "${f.name}": """ +
-                s"$parquetTypesString in case-insensitive mode")
+              throw QueryExecutionErrors.foundDuplicateFieldInCaseInsensitiveModeError(
+                f.name, parquetTypesString)
             } else {
               clipParquetType(parquetTypes.head, f.dataType, caseSensitive)
             }

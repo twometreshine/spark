@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
@@ -16,19 +16,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Utility for updating JIRA's with information about Github pull requests
+# Utility for updating JIRA's with information about GitHub pull requests
 
 import json
 import os
 import re
 import sys
-import urllib2
+from urllib.request import urlopen
+from urllib.request import Request
+from urllib.error import HTTPError
 
 try:
     import jira.client
 except ImportError:
     print("This tool requires the jira-python library")
-    print("Install using 'sudo pip install jira'")
+    print("Install using 'sudo pip3 install jira'")
     sys.exit(-1)
 
 # User facing configs
@@ -52,16 +54,16 @@ MAX_FILE = ".github-jira-max"
 
 def get_url(url):
     try:
-        request = urllib2.Request(url)
+        request = Request(url)
         request.add_header('Authorization', 'token %s' % GITHUB_OAUTH_KEY)
-        return urllib2.urlopen(request)
-    except urllib2.HTTPError:
+        return urlopen(request)
+    except HTTPError:
         print("Unable to fetch URL, exiting: %s" % url)
         sys.exit(-1)
 
 
 def get_json(urllib_response):
-    return json.load(urllib_response)
+    return json.loads(urllib_response.read().decode("utf-8"))
 
 
 # Return a list of (JIRA id, JSON dict) tuples:
@@ -80,7 +82,7 @@ def get_jira_prs():
                 result = result + [(jira, pull)]
 
         # Check if there is another page
-        link_headers = filter(lambda k: k.startswith("Link"), page.info().headers)
+        link_headers = list(filter(lambda k: k.startswith("Link"), page.headers))
         if not link_headers or "next" not in link_headers[0]:
             has_next_page = False
         else:
@@ -109,7 +111,8 @@ def build_pr_component_dic(jira_prs):
     dic = {}
     for issue, pr in jira_prs:
         print(issue)
-        jira_components = [c.name.upper() for c in jira_client.issue(issue).fields.components]
+        page = get_json(get_url(JIRA_API_BASE + "/rest/api/2/issue/" + issue))
+        jira_components = [c['name'].upper() for c in page['fields']['components']]
         if pr['number'] in dic:
             dic[pr['number']][1].update(jira_components)
         else:
@@ -122,13 +125,13 @@ def reset_pr_labels(pr_num, jira_components):
     url = '%s/issues/%s/labels' % (GITHUB_API_BASE, pr_num)
     labels = ', '.join(('"%s"' % c) for c in jira_components)
     try:
-        request = urllib2.Request(url, data='{"labels":[%s]}' % labels)
+        request = Request(url, data=('{"labels":[%s]}' % labels).encode('utf-8'))
         request.add_header('Content-Type', 'application/json')
         request.add_header('Authorization', 'token %s' % GITHUB_OAUTH_KEY)
         request.get_method = lambda: 'PUT'
-        urllib2.urlopen(request)
+        urlopen(request)
         print("Set %s with labels %s" % (pr_num, labels))
-    except urllib2.HTTPError:
+    except HTTPError:
         print("Unable to update PR labels, exiting: %s" % url)
         sys.exit(-1)
 
@@ -139,9 +142,9 @@ jira_client = jira.client.JIRA({'server': JIRA_API_BASE},
 jira_prs = get_jira_prs()
 
 previous_max = get_max_pr()
-print("Retrieved %s JIRA PR's from Github" % len(jira_prs))
+print("Retrieved %s JIRA PR's from GitHub" % len(jira_prs))
 jira_prs = [(k, v) for k, v in jira_prs if int(v['number']) > previous_max]
-print("%s PR's remain after excluding visted ones" % len(jira_prs))
+print("%s PR's remain after excluding visited ones" % len(jira_prs))
 
 num_updates = 0
 considered = []
@@ -154,9 +157,10 @@ for issue, pr in sorted(jira_prs, key=lambda kv: int(kv[1]['number'])):
     considered = considered + [pr_num]
 
     url = pr['html_url']
-    title = "[Github] Pull Request #%s (%s)" % (pr['number'], pr['user']['login'])
+    title = "[GitHub] Pull Request #%s (%s)" % (pr['number'], pr['user']['login'])
     try:
-        existing_links = map(lambda l: l.raw['object']['url'], jira_client.remote_links(issue))
+        page = get_json(get_url(JIRA_API_BASE + "/rest/api/2/issue/" + issue + "/remotelink"))
+        existing_links = map(lambda l: l['object']['url'], page)
     except:
         print("Failure reading JIRA %s (does it exist?)" % issue)
         print(sys.exc_info()[0])
@@ -170,7 +174,7 @@ for issue, pr in sorted(jira_prs, key=lambda kv: int(kv[1]['number'])):
     destination = {"title": title, "url": url, "icon": icon}
     # For all possible fields see:
     # https://developer.atlassian.com/display/JIRADEV/Fields+in+Remote+Issue+Links
-    # application = {"name": "Github pull requests", "type": "org.apache.spark.jira.github"}
+    # application = {"name": "GitHub pull requests", "type": "org.apache.spark.jira.github"}
     jira_client.add_remote_link(issue, destination)
 
     comment = "User '%s' has created a pull request for this issue:" % pr['user']['login']

@@ -22,14 +22,17 @@ import scala.collection.immutable.IndexedSeq
 import org.apache.hadoop.fs.{FileSystem, Path}
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.ConfigEntry
 import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SubqueryExpression}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
 import org.apache.spark.sql.catalyst.plans.logical.{IgnoreCachedData, LogicalPlan, ResolvedHint}
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.command.CommandUtils
 import org.apache.spark.sql.execution.datasources.{FileIndex, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, FileTable}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
 
@@ -44,7 +47,7 @@ case class CachedData(plan: LogicalPlan, cachedRepresentation: InMemoryRelation)
  *
  * Internal to Spark SQL.
  */
-class CacheManager extends Logging {
+class CacheManager extends Logging with AdaptiveSparkPlanHelper {
 
   /**
    * Maintains the list of cached plans as an immutable sequence.  Any updates to the list
@@ -53,6 +56,17 @@ class CacheManager extends Logging {
    */
   @transient @volatile
   private var cachedData = IndexedSeq[CachedData]()
+
+  /**
+   * Configurations needs to be turned off, to avoid regression for cached query, so that the
+   * outputPartitioning of the underlying cached query plan can be leveraged later.
+   * Configurations include:
+   * 1. AQE
+   * 2. Automatic bucketed table scan
+   */
+  private val forceDisableConfigs: Seq[ConfigEntry[Boolean]] = Seq(
+    SQLConf.ADAPTIVE_EXECUTION_ENABLED,
+    SQLConf.AUTO_BUCKETED_SCAN_ENABLED)
 
   /** Clears all cached tables. */
   def clearCache(): Unit = this.synchronized {
@@ -74,17 +88,42 @@ class CacheManager extends Logging {
       query: Dataset[_],
       tableName: Option[String] = None,
       storageLevel: StorageLevel = MEMORY_AND_DISK): Unit = {
-    val planToCache = query.logicalPlan
+    cacheQuery(query.sparkSession, query.logicalPlan, tableName, storageLevel)
+  }
+
+  /**
+   * Caches the data produced by the given [[LogicalPlan]].
+   * Unlike `RDD.cache()`, the default storage level is set to be `MEMORY_AND_DISK` because
+   * recomputing the in-memory columnar representation of the underlying table is expensive.
+   */
+  def cacheQuery(
+      spark: SparkSession,
+      planToCache: LogicalPlan,
+      tableName: Option[String]): Unit = {
+    cacheQuery(spark, planToCache, tableName, MEMORY_AND_DISK)
+  }
+
+  /**
+   * Caches the data produced by the given [[LogicalPlan]].
+   */
+  def cacheQuery(
+      spark: SparkSession,
+      planToCache: LogicalPlan,
+      tableName: Option[String],
+      storageLevel: StorageLevel): Unit = {
     if (lookupCachedData(planToCache).nonEmpty) {
       logWarning("Asked to cache already cached data.")
     } else {
-      val sparkSession = query.sparkSession
-      val inMemoryRelation = InMemoryRelation(
-        sparkSession.sessionState.conf.useCompression,
-        sparkSession.sessionState.conf.columnBatchSize, storageLevel,
-        sparkSession.sessionState.executePlan(planToCache).executedPlan,
-        tableName,
-        planToCache)
+      val sessionWithConfigsOff = SparkSession.getOrCloneSessionWithConfigsOff(
+        spark, forceDisableConfigs)
+      val inMemoryRelation = sessionWithConfigsOff.withActive {
+        val qe = sessionWithConfigsOff.sessionState.executePlan(planToCache)
+        InMemoryRelation(
+          storageLevel,
+          qe,
+          tableName)
+      }
+
       this.synchronized {
         if (lookupCachedData(planToCache).nonEmpty) {
           logWarning("Data has already been cached.")
@@ -182,12 +221,14 @@ class CacheManager extends Logging {
       // Remove the cache entry before creating a new ones.
       cachedData = cachedData.filterNot(cd => needToRecache.exists(_ eq cd))
     }
-    needToRecache.map { cd =>
+    needToRecache.foreach { cd =>
       cd.cachedRepresentation.cacheBuilder.clearCache()
-      val plan = spark.sessionState.executePlan(cd.plan).executedPlan
-      val newCache = InMemoryRelation(
-        cacheBuilder = cd.cachedRepresentation.cacheBuilder.copy(cachedPlan = plan),
-        logicalPlan = cd.plan)
+      val sessionWithConfigsOff = SparkSession.getOrCloneSessionWithConfigsOff(
+        spark, forceDisableConfigs)
+      val newCache = sessionWithConfigsOff.withActive {
+        val qe = sessionWithConfigsOff.sessionState.executePlan(cd.plan)
+        InMemoryRelation(cd.cachedRepresentation.cacheBuilder, qe)
+      }
       val recomputedPlan = cd.copy(cachedRepresentation = newCache)
       this.synchronized {
         if (lookupCachedData(recomputedPlan.plan).nonEmpty) {
@@ -237,12 +278,17 @@ class CacheManager extends Logging {
    * `HadoopFsRelation` node(s) as part of its logical plan.
    */
   def recacheByPath(spark: SparkSession, resourcePath: String): Unit = {
-    val (fs, qualifiedPath) = {
-      val path = new Path(resourcePath)
-      val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
-      (fs, fs.makeQualified(path))
-    }
+    val path = new Path(resourcePath)
+    val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
+    recacheByPath(spark, path, fs)
+  }
 
+  /**
+   * Tries to re-cache all the cache entries that contain `resourcePath` in one or more
+   * `HadoopFsRelation` node(s) as part of its logical plan.
+   */
+  def recacheByPath(spark: SparkSession, resourcePath: Path, fs: FileSystem): Unit = {
+    val qualifiedPath = fs.makeQualified(resourcePath)
     recacheByCondition(spark, _.plan.find(lookupAndRefresh(_, fs, qualifiedPath)).isDefined)
   }
 
@@ -260,7 +306,7 @@ class CacheManager extends Logging {
         case _ => false
       }
 
-      case DataSourceV2Relation(fileTable: FileTable, _, _) =>
+      case DataSourceV2Relation(fileTable: FileTable, _, _, _, _) =>
         refreshFileIndexIfNecessary(fileTable.fileIndex, fs, qualifiedPath)
 
       case _ => false

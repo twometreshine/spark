@@ -27,20 +27,19 @@ import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.{VectorLoader, VectorSchemaRoot}
 import org.apache.arrow.vector.ipc.JsonFileReader
 import org.apache.arrow.vector.util.{ByteArrayReadableSeekableByteChannel, Validator}
-import org.scalatest.BeforeAndAfterAll
 
 import org.apache.spark.{SparkException, TaskContext}
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.sql.types.{BinaryType, Decimal, IntegerType, StructField, StructType}
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{ArrayType, BinaryType, Decimal, IntegerType, NullType, StructField, StructType}
 import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.util.Utils
 
 
-class ArrowConvertersSuite extends SharedSQLContext with BeforeAndAfterAll {
+class ArrowConvertersSuite extends SharedSparkSession {
   import testImplicits._
 
   private var tempDataPath: String = _
@@ -1072,6 +1071,61 @@ class ArrowConvertersSuite extends SharedSQLContext with BeforeAndAfterAll {
     collectAndValidate(df, json, "structData.json")
   }
 
+  test("null type conversion") {
+    val json =
+      s"""
+         |{
+         |  "schema" : {
+         |    "fields": [ {
+         |      "name" : "a",
+         |      "type" : {
+         |        "name" : "null"
+         |      },
+         |      "nullable" : true,
+         |      "children" : [ ]
+         |    }, {
+         |      "name" : "b",
+         |      "type" : {
+         |        "name" : "list"
+         |      },
+         |      "nullable" : true,
+         |      "children" : [ {
+         |        "name" : "element",
+         |        "type" : {
+         |          "name" : "null"
+         |        },
+         |        "nullable" : true,
+         |        "children" : [ ]
+         |      } ]
+         |    } ]
+         |  },
+         |  "batches" : [ {
+         |    "count" : 3,
+         |    "columns" : [ {
+         |      "name" : "a",
+         |      "count" : 3
+         |    }, {
+         |      "name" : "b",
+         |      "count" : 3,
+         |      "VALIDITY" : [ 1, 1, 1 ],
+         |      "OFFSET" : [ 0, 2, 4, 6 ],
+         |      "children" : [ {
+         |        "name" : "element",
+         |        "count" : 6
+         |      } ]
+         |    } ]
+         |  } ]
+         |}
+       """.stripMargin
+
+    val data = Seq(null, null, null)
+    val rdd = sparkContext.parallelize(data.map(n => Row(n, Seq(n, n))))
+    val schema = new StructType().add("a", NullType).add("b", ArrayType(NullType))
+    val df = spark.createDataFrame(rdd, schema)
+
+    collectAndValidate(df, json, "nullData.json")
+  }
+
   test("partitioned DataFrame") {
     val json1 =
       s"""
@@ -1209,17 +1263,13 @@ class ArrowConvertersSuite extends SharedSQLContext with BeforeAndAfterAll {
     spark.conf.unset(SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key)
   }
 
-  testQuietly("unsupported types") {
-    def runUnsupported(block: => Unit): Unit = {
-      val msg = intercept[SparkException] {
-        block
-      }
-      assert(msg.getMessage.contains("Unsupported data type"))
-      assert(msg.getCause.getClass === classOf[UnsupportedOperationException])
+  testQuietly("interval is unsupported for arrow") {
+    val e = intercept[SparkException] {
+      calendarIntervalData.toDF().toArrowBatchRdd.collect()
     }
 
-    runUnsupported { mapData.toDF().toArrowBatchRdd.collect() }
-    runUnsupported { complexData.toArrowBatchRdd.collect() }
+    assert(e.getCause.isInstanceOf[UnsupportedOperationException])
+    assert(e.getCause.getMessage.contains("Unsupported data type: interval"))
   }
 
   test("test Arrow Validator") {

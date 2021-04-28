@@ -22,7 +22,7 @@ import time
 
 from pyspark.sql import Row
 from pyspark.sql.functions import lit
-from pyspark.sql.types import *
+from pyspark.sql.types import StructType, StructField, DecimalType, BinaryType
 from pyspark.testing.sqlutils import ReusedSQLTestCase, UTCOffsetTimezone
 
 
@@ -132,13 +132,17 @@ class SerdeTests(ReusedSQLTestCase):
         df = self.spark.createDataFrame(data, "array<integer>")
         self.assertEqual(len(list(filter(lambda r: None in r.value, df.collect()))), 0)
 
+    def test_bytes_as_binary_type(self):
+        df = self.spark.createDataFrame([[b"abcd"]], "col binary")
+        self.assertEqual(df.first().col, bytearray(b'abcd'))
+
 
 if __name__ == "__main__":
     import unittest
-    from pyspark.sql.tests.test_serde import *
+    from pyspark.sql.tests.test_serde import *  # noqa: F401
 
     try:
-        import xmlrunner
+        import xmlrunner  # type: ignore[import]
         testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
     except ImportError:
         testRunner = None

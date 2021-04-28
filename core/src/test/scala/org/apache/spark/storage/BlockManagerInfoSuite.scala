@@ -31,10 +31,9 @@ class BlockManagerInfoSuite extends SparkFunSuite {
       val bmInfo = new BlockManagerInfo(
         BlockManagerId("executor0", "host", 1234, None),
         timeMs = 300,
-        Array(),
         maxOnHeapMem = 10000,
         maxOffHeapMem = 20000,
-        slaveEndpoint = null,
+        storageEndpoint = null,
         if (svcEnabled) Some(new JHashMap[BlockId, BlockStatus]) else None)
       test(s"$testName externalShuffleServiceEnabled=$svcEnabled") {
         f(svcEnabled, bmInfo)

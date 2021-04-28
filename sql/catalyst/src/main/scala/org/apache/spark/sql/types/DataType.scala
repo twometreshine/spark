@@ -21,16 +21,22 @@ import java.util.Locale
 
 import scala.util.control.NonFatal
 
+import com.fasterxml.jackson.databind.annotation.{JsonDeserialize, JsonSerialize}
 import org.json4s._
 import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.annotation.Stable
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.expressions.{Cast, Expression}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.util.DataTypeJsonUtils.{DataTypeJsonDeserializer, DataTypeJsonSerializer}
+import org.apache.spark.sql.catalyst.util.StringUtils.StringConcat
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy.{ANSI, STRICT}
 import org.apache.spark.util.Utils
 
 /**
@@ -38,7 +44,10 @@ import org.apache.spark.util.Utils
  *
  * @since 1.3.0
  */
+
 @Stable
+@JsonSerialize(using = classOf[DataTypeJsonSerializer])
+@JsonDeserialize(using = classOf[DataTypeJsonDeserializer])
 abstract class DataType extends AbstractDataType {
   /**
    * Enables matching against DataType for expressions:
@@ -115,20 +124,54 @@ abstract class DataType extends AbstractDataType {
 object DataType {
 
   private val FIXED_DECIMAL = """decimal\(\s*(\d+)\s*,\s*(\-?\d+)\s*\)""".r
+  private val CHAR_TYPE = """char\(\s*(\d+)\s*\)""".r
+  private val VARCHAR_TYPE = """varchar\(\s*(\d+)\s*\)""".r
 
   def fromDDL(ddl: String): DataType = {
+    parseTypeWithFallback(
+      ddl,
+      CatalystSqlParser.parseDataType,
+      "Cannot parse the data type: ",
+      fallbackParser = str => CatalystSqlParser.parseTableSchema(str))
+  }
+
+  /**
+   * Parses data type from a string with schema. It calls `parser` for `schema`.
+   * If it fails, calls `fallbackParser`. If the fallback function fails too, combines error message
+   * from `parser` and `fallbackParser`.
+   *
+   * @param schema The schema string to parse by `parser` or `fallbackParser`.
+   * @param parser The function that should be invoke firstly.
+   * @param errorMsg The error message for `parser`.
+   * @param fallbackParser The function that is called when `parser` fails.
+   * @return The data type parsed from the `schema` schema.
+   */
+  def parseTypeWithFallback(
+      schema: String,
+      parser: String => DataType,
+      errorMsg: String,
+      fallbackParser: String => DataType): DataType = {
     try {
-      CatalystSqlParser.parseDataType(ddl)
+      parser(schema)
     } catch {
-      case NonFatal(_) => CatalystSqlParser.parseTableSchema(ddl)
+      case NonFatal(e1) =>
+        try {
+          fallbackParser(schema)
+        } catch {
+          case NonFatal(e2) =>
+            throw new AnalysisException(
+              message = s"$errorMsg${e1.getMessage}\nFailed fallback parsing: ${e2.getMessage}",
+              cause = Some(e1.getCause))
+        }
     }
   }
 
   def fromJson(json: String): DataType = parseDataType(parse(json))
 
-  private val nonDecimalNameToType = {
+  private val otherTypes = {
     Seq(NullType, DateType, TimestampType, BinaryType, IntegerType, BooleanType, LongType,
-      DoubleType, FloatType, ShortType, ByteType, StringType, CalendarIntervalType)
+      DoubleType, FloatType, ShortType, ByteType, StringType, CalendarIntervalType,
+      DayTimeIntervalType, YearMonthIntervalType)
       .map(t => t.typeName -> t).toMap
   }
 
@@ -137,7 +180,9 @@ object DataType {
     name match {
       case "decimal" => DecimalType.USER_DEFAULT
       case FIXED_DECIMAL(precision, scale) => DecimalType(precision.toInt, scale.toInt)
-      case other => nonDecimalNameToType.getOrElse(
+      case CHAR_TYPE(length) => CharType(length.toInt)
+      case VARCHAR_TYPE(length) => VarcharType(length.toInt)
+      case other => otherTypes.getOrElse(
         other,
         throw new IllegalArgumentException(
           s"Failed to convert the JSON string '$name' to a data type."))
@@ -146,7 +191,7 @@ object DataType {
 
   private object JSortedObject {
     def unapplySeq(value: JValue): Option[List[(String, JValue)]] = value match {
-      case JObject(seq) => Some(seq.toList.sortBy(_._1))
+      case JObject(seq) => Some(seq.sortBy(_._1))
       case _ => None
     }
   }
@@ -214,16 +259,17 @@ object DataType {
   }
 
   protected[types] def buildFormattedString(
-    dataType: DataType,
-    prefix: String,
-    builder: StringBuilder): Unit = {
+      dataType: DataType,
+      prefix: String,
+      stringConcat: StringConcat,
+      maxDepth: Int): Unit = {
     dataType match {
       case array: ArrayType =>
-        array.buildFormattedString(prefix, builder)
+        array.buildFormattedString(prefix, stringConcat, maxDepth - 1)
       case struct: StructType =>
-        struct.buildFormattedString(prefix, builder)
+        struct.buildFormattedString(prefix, stringConcat, maxDepth - 1)
       case map: MapType =>
-        map.buildFormattedString(prefix, builder)
+        map.buildFormattedString(prefix, stringConcat, maxDepth - 1)
       case _ =>
     }
   }
@@ -262,21 +308,49 @@ object DataType {
    *   of `fromField.nullable` and `toField.nullable` are false.
    */
   private[sql] def equalsIgnoreCompatibleNullability(from: DataType, to: DataType): Boolean = {
+    equalsIgnoreCompatibleNullability(from, to, ignoreName = false)
+  }
+
+  /**
+   * Compares two types, ignoring compatible nullability of ArrayType, MapType, StructType, and
+   * also the field name. It compares based on the position.
+   *
+   * Compatible nullability is defined as follows:
+   *   - If `from` and `to` are ArrayTypes, `from` has a compatible nullability with `to`
+   *   if and only if `to.containsNull` is true, or both of `from.containsNull` and
+   *   `to.containsNull` are false.
+   *   - If `from` and `to` are MapTypes, `from` has a compatible nullability with `to`
+   *   if and only if `to.valueContainsNull` is true, or both of `from.valueContainsNull` and
+   *   `to.valueContainsNull` are false.
+   *   - If `from` and `to` are StructTypes, `from` has a compatible nullability with `to`
+   *   if and only if for all every pair of fields, `to.nullable` is true, or both
+   *   of `fromField.nullable` and `toField.nullable` are false.
+   */
+  private[sql] def equalsIgnoreNameAndCompatibleNullability(
+      from: DataType,
+      to: DataType): Boolean = {
+    equalsIgnoreCompatibleNullability(from, to, ignoreName = true)
+  }
+
+  private def equalsIgnoreCompatibleNullability(
+      from: DataType,
+      to: DataType,
+      ignoreName: Boolean = false): Boolean = {
     (from, to) match {
       case (ArrayType(fromElement, fn), ArrayType(toElement, tn)) =>
-        (tn || !fn) && equalsIgnoreCompatibleNullability(fromElement, toElement)
+        (tn || !fn) && equalsIgnoreCompatibleNullability(fromElement, toElement, ignoreName)
 
       case (MapType(fromKey, fromValue, fn), MapType(toKey, toValue, tn)) =>
         (tn || !fn) &&
-          equalsIgnoreCompatibleNullability(fromKey, toKey) &&
-          equalsIgnoreCompatibleNullability(fromValue, toValue)
+          equalsIgnoreCompatibleNullability(fromKey, toKey, ignoreName) &&
+          equalsIgnoreCompatibleNullability(fromValue, toValue, ignoreName)
 
       case (StructType(fromFields), StructType(toFields)) =>
         fromFields.length == toFields.length &&
           fromFields.zip(toFields).forall { case (fromField, toField) =>
-            fromField.name == toField.name &&
+            (ignoreName || fromField.name == toField.name) &&
               (toField.nullable || !fromField.nullable) &&
-              equalsIgnoreCompatibleNullability(fromField.dataType, toField.dataType)
+              equalsIgnoreCompatibleNullability(fromField.dataType, toField.dataType, ignoreName)
           }
 
       case (fromDataType, toDataType) => fromDataType == toDataType
@@ -319,19 +393,19 @@ object DataType {
       ignoreNullability: Boolean = false): Boolean = {
     (from, to) match {
       case (left: ArrayType, right: ArrayType) =>
-        equalsStructurally(left.elementType, right.elementType) &&
+        equalsStructurally(left.elementType, right.elementType, ignoreNullability) &&
           (ignoreNullability || left.containsNull == right.containsNull)
 
       case (left: MapType, right: MapType) =>
-        equalsStructurally(left.keyType, right.keyType) &&
-          equalsStructurally(left.valueType, right.valueType) &&
+        equalsStructurally(left.keyType, right.keyType, ignoreNullability) &&
+          equalsStructurally(left.valueType, right.valueType, ignoreNullability) &&
           (ignoreNullability || left.valueContainsNull == right.valueContainsNull)
 
       case (StructType(fromFields), StructType(toFields)) =>
         fromFields.length == toFields.length &&
           fromFields.zip(toFields)
             .forall { case (l, r) =>
-              equalsStructurally(l.dataType, r.dataType) &&
+              equalsStructurally(l.dataType, r.dataType, ignoreNullability) &&
                 (ignoreNullability || l.nullable == r.nullable)
             }
 
@@ -371,12 +445,14 @@ object DataType {
       byName: Boolean,
       resolver: Resolver,
       context: String,
+      storeAssignmentPolicy: StoreAssignmentPolicy.Value,
       addError: String => Unit): Boolean = {
     (write, read) match {
       case (wArr: ArrayType, rArr: ArrayType) =>
         // run compatibility check first to produce all error messages
         val typesCompatible = canWrite(
-          wArr.elementType, rArr.elementType, byName, resolver, context + ".element", addError)
+          wArr.elementType, rArr.elementType, byName, resolver, context + ".element",
+          storeAssignmentPolicy, addError)
 
         if (wArr.containsNull && !rArr.containsNull) {
           addError(s"Cannot write nullable elements to array of non-nulls: '$context'")
@@ -391,9 +467,11 @@ object DataType {
 
         // run compatibility check first to produce all error messages
         val keyCompatible = canWrite(
-          wMap.keyType, rMap.keyType, byName, resolver, context + ".key", addError)
+          wMap.keyType, rMap.keyType, byName, resolver, context + ".key",
+          storeAssignmentPolicy, addError)
         val valueCompatible = canWrite(
-          wMap.valueType, rMap.valueType, byName, resolver, context + ".value", addError)
+          wMap.valueType, rMap.valueType, byName, resolver, context + ".value",
+          storeAssignmentPolicy, addError)
 
         if (wMap.valueContainsNull && !rMap.valueContainsNull) {
           addError(s"Cannot write nullable values to map of non-nulls: '$context'")
@@ -409,7 +487,8 @@ object DataType {
             val nameMatch = resolver(wField.name, rField.name) || isSparkGeneratedName(wField.name)
             val fieldContext = s"$context.${rField.name}"
             val typesCompatible = canWrite(
-              wField.dataType, rField.dataType, byName, resolver, fieldContext, addError)
+              wField.dataType, rField.dataType, byName, resolver, fieldContext,
+              storeAssignmentPolicy, addError)
 
             if (byName && !nameMatch) {
               addError(s"Struct '$context' $i-th field name does not match " +
@@ -441,9 +520,19 @@ object DataType {
 
         fieldCompatible
 
-      case (w: AtomicType, r: AtomicType) =>
+      case (w: AtomicType, r: AtomicType) if storeAssignmentPolicy == STRICT =>
         if (!Cast.canUpCast(w, r)) {
-          addError(s"Cannot safely cast '$context': $w to $r")
+          addError(s"Cannot safely cast '$context': ${w.catalogString} to ${r.catalogString}")
+          false
+        } else {
+          true
+        }
+
+      case (_: NullType, _) if storeAssignmentPolicy == ANSI => true
+
+      case (w: AtomicType, r: AtomicType) if storeAssignmentPolicy == ANSI =>
+        if (!Cast.canANSIStoreAssign(w, r)) {
+          addError(s"Cannot safely cast '$context': ${w.catalogString} to ${r.catalogString}")
           false
         } else {
           true
@@ -453,7 +542,8 @@ object DataType {
         true
 
       case (w, r) =>
-        addError(s"Cannot write '$context': $w is incompatible with $r")
+        addError(s"Cannot write '$context': " +
+          s"${w.catalogString} is incompatible with ${r.catalogString}")
         false
     }
   }

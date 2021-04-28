@@ -31,7 +31,8 @@ import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
-import org.apache.spark.sql.catalyst.util.DateTimeUtils._
+import org.apache.spark.sql.catalyst.util.DateTimeConstants._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.hash.Murmur3_x86_32
@@ -51,8 +52,11 @@ import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
     Examples:
       > SELECT _FUNC_('Spark');
        8cde774d6f7333752ed72cacddb05126
-  """)
-case class Md5(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+  """,
+  since = "1.5.0",
+  group = "hash_funcs")
+case class Md5(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = StringType
 
@@ -65,6 +69,8 @@ case class Md5(child: Expression) extends UnaryExpression with ImplicitCastInput
     defineCodeGen(ctx, ev, c =>
       s"UTF8String.fromString(${classOf[DigestUtils].getName}.md5Hex($c))")
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Md5 = copy(child = newChild)
 }
 
 /**
@@ -85,10 +91,12 @@ case class Md5(child: Expression) extends UnaryExpression with ImplicitCastInput
     Examples:
       > SELECT _FUNC_('Spark', 256);
        529bc3b07127ecb7e53a4dcf1991d9152c24537d919178022b2c42657f79a26b
-  """)
+  """,
+  since = "1.5.0",
+  group = "hash_funcs")
 // scalastyle:on line.size.limit
 case class Sha2(left: Expression, right: Expression)
-  extends BinaryExpression with Serializable with ImplicitCastInputTypes {
+  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant with Serializable {
 
   override def dataType: DataType = StringType
   override def nullable: Boolean = true
@@ -146,6 +154,9 @@ case class Sha2(left: Expression, right: Expression)
       """
     })
   }
+
+  override protected def withNewChildrenInternal(newLeft: Expression, newRight: Expression): Sha2 =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -158,8 +169,11 @@ case class Sha2(left: Expression, right: Expression)
     Examples:
       > SELECT _FUNC_('Spark');
        85f5955f4b27a9a4c2aab6ffe5d7189fc298b92c
-  """)
-case class Sha1(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+  """,
+  since = "1.5.0",
+  group = "hash_funcs")
+case class Sha1(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = StringType
 
@@ -173,6 +187,8 @@ case class Sha1(child: Expression) extends UnaryExpression with ImplicitCastInpu
       s"UTF8String.fromString(${classOf[DigestUtils].getName}.sha1Hex($c))"
     )
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Sha1 = copy(child = newChild)
 }
 
 /**
@@ -185,8 +201,11 @@ case class Sha1(child: Expression) extends UnaryExpression with ImplicitCastInpu
     Examples:
       > SELECT _FUNC_('Spark');
        1557323817
-  """)
-case class Crc32(child: Expression) extends UnaryExpression with ImplicitCastInputTypes {
+  """,
+  since = "1.5.0",
+  group = "hash_funcs")
+case class Crc32(child: Expression)
+  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   override def dataType: DataType = LongType
 
@@ -209,6 +228,8 @@ case class Crc32(child: Expression) extends UnaryExpression with ImplicitCastInp
       """
     })
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Crc32 = copy(child = newChild)
 }
 
 
@@ -217,27 +238,30 @@ case class Crc32(child: Expression) extends UnaryExpression with ImplicitCastInp
  * is not exposed to users and should only be set inside spark SQL.
  *
  * The hash value for an expression depends on its type and seed:
- *  - null:               seed
- *  - boolean:            turn boolean into int, 1 for true, 0 for false, and then use murmur3 to
- *                        hash this int with seed.
- *  - byte, short, int:   use murmur3 to hash the input as int with seed.
- *  - long:               use murmur3 to hash the long input with seed.
- *  - float:              turn it into int: java.lang.Float.floatToIntBits(input), and hash it.
- *  - double:             turn it into long: java.lang.Double.doubleToLongBits(input), and hash it.
- *  - decimal:            if it's a small decimal, i.e. precision <= 18, turn it into long and hash
- *                        it. Else, turn it into bytes and hash it.
- *  - calendar interval:  hash `microseconds` first, and use the result as seed to hash `months`.
- *  - binary:             use murmur3 to hash the bytes with seed.
- *  - string:             get the bytes of string and hash it.
- *  - array:              The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each element, and assign the element hash value
- *                        to `result`.
- *  - map:                The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each key-value, and assign the key-value hash
- *                        value to `result`.
- *  - struct:             The `result` starts with seed, then use `result` as seed, recursively
- *                        calculate hash value for each field, and assign the field hash value to
- *                        `result`.
+ *  - null:                    seed
+ *  - boolean:                 turn boolean into int, 1 for true, 0 for false,
+ *                             and then use murmur3 to hash this int with seed.
+ *  - byte, short, int:        use murmur3 to hash the input as int with seed.
+ *  - long:                    use murmur3 to hash the long input with seed.
+ *  - float:                   turn it into int: java.lang.Float.floatToIntBits(input), and hash it.
+ *  - double:                  turn it into long: java.lang.Double.doubleToLongBits(input),
+ *                             and hash it.
+ *  - decimal:                 if it's a small decimal, i.e. precision <= 18, turn it into long
+ *                             and hash it. Else, turn it into bytes and hash it.
+ *  - calendar interval:       hash `microseconds` first, and use the result as seed
+ *                             to hash `months`.
+ *  - interval day to second:  it store long value of `microseconds`, use murmur3 to hash the long
+ *                             input with seed.
+ *  - interval year to month:  it store int value of `months`, use murmur3 to hash the int
+ *                             input with seed.
+ *  - binary:                  use murmur3 to hash the bytes with seed.
+ *  - string:                  get the bytes of string and hash it.
+ *  - array:                   The `result` starts with seed, then use `result` as seed, recursively
+ *                             calculate hash value for each element, and assign the element hash
+ *                             value to `result`.
+ *  - struct:                  The `result` starts with seed, then use `result` as seed, recursively
+ *                             calculate hash value for each field, and assign the field hash value
+ *                             to `result`.
  *
  * Finally we aggregate the hash values for each expression by the same way of struct.
  */
@@ -249,10 +273,21 @@ abstract class HashExpression[E] extends Expression {
 
   override def nullable: Boolean = false
 
+  private def hasMapType(dt: DataType): Boolean = {
+    dt.existsRecursively(_.isInstanceOf[MapType])
+  }
+
   override def checkInputDataTypes(): TypeCheckResult = {
     if (children.length < 1) {
       TypeCheckResult.TypeCheckFailure(
         s"input to function $prettyName requires at least one argument")
+    } else if (children.exists(child => hasMapType(child.dataType)) &&
+        !SQLConf.get.getConf(SQLConf.LEGACY_ALLOW_HASH_ON_MAPTYPE)) {
+      TypeCheckResult.TypeCheckFailure(
+        s"input to function $prettyName cannot contain elements of MapType. In Spark, same maps " +
+          "may have different hashcode, thus hash expressions are prohibited on MapType elements." +
+          s" To restore previous behavior set ${SQLConf.LEGACY_ALLOW_HASH_ON_MAPTYPE.key} " +
+          "to true.")
     } else {
       TypeCheckResult.TypeCheckSuccess
     }
@@ -282,6 +317,7 @@ abstract class HashExpression[E] extends Expression {
     }
 
     val hashResultType = CodeGenerator.javaType(dataType)
+    val typedSeed = if (dataType.sameType(LongType)) s"${seed}L" else s"$seed"
     val codes = ctx.splitExpressionsWithCurrentInputs(
       expressions = childrenHash,
       funcName = "computeHash",
@@ -296,7 +332,7 @@ abstract class HashExpression[E] extends Expression {
 
     ev.copy(code =
       code"""
-         |$hashResultType ${ev.value} = $seed;
+         |$hashResultType ${ev.value} = $typedSeed;
          |$codes
        """.stripMargin)
   }
@@ -445,6 +481,8 @@ abstract class HashExpression[E] extends Expression {
     case DoubleType => genHashDouble(input, result)
     case d: DecimalType => genHashDecimal(ctx, d, input, result)
     case CalendarIntervalType => genHashCalendarInterval(input, result)
+    case DayTimeIntervalType => genHashLong(input, result)
+    case YearMonthIntervalType => genHashInt(input, result)
     case BinaryType => genHashBytes(input, result)
     case StringType => genHashString(input, result)
     case ArrayType(et, containsNull) => genHashForArray(ctx, input, result, et, containsNull)
@@ -495,7 +533,7 @@ abstract class InterpretedHashFunction {
           val bytes = d.toJavaBigDecimal.unscaledValue().toByteArray
           hashUnsafeBytes(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, seed)
         }
-      case c: CalendarInterval => hashInt(c.months, hashLong(c.microseconds, seed))
+      case c: CalendarInterval => hashInt(c.months, hashInt(c.days, hashLong(c.microseconds, seed)))
       case a: Array[Byte] =>
         hashUnsafeBytes(a, Platform.BYTE_ARRAY_OFFSET, a.length, seed)
       case s: UTF8String =>
@@ -562,7 +600,9 @@ abstract class InterpretedHashFunction {
     Examples:
       > SELECT _FUNC_('Spark', array(123), 2);
        -1321691492
-  """)
+  """,
+  since = "2.0.0",
+  group = "hash_funcs")
 case class Murmur3Hash(children: Seq[Expression], seed: Int) extends HashExpression[Int] {
   def this(arguments: Seq[Expression]) = this(arguments, 42)
 
@@ -575,6 +615,9 @@ case class Murmur3Hash(children: Seq[Expression], seed: Int) extends HashExpress
   override protected def computeHash(value: Any, dataType: DataType, seed: Int): Int = {
     Murmur3HashFunction.hash(value, dataType, seed).toInt
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Murmur3Hash =
+    copy(children = newChildren)
 }
 
 object Murmur3HashFunction extends InterpretedHashFunction {
@@ -600,7 +643,9 @@ object Murmur3HashFunction extends InterpretedHashFunction {
     Examples:
       > SELECT _FUNC_('Spark', array(123), 2);
        5602566077635097486
-  """)
+  """,
+  since = "3.0.0",
+  group = "hash_funcs")
 case class XxHash64(children: Seq[Expression], seed: Long) extends HashExpression[Long] {
   def this(arguments: Seq[Expression]) = this(arguments, 42L)
 
@@ -613,6 +658,9 @@ case class XxHash64(children: Seq[Expression], seed: Long) extends HashExpressio
   override protected def computeHash(value: Any, dataType: DataType, seed: Long): Long = {
     XxHash64Function.hash(value, dataType, seed)
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): XxHash64 =
+    copy(children = newChildren)
 }
 
 object XxHash64Function extends InterpretedHashFunction {
@@ -633,7 +681,9 @@ object XxHash64Function extends InterpretedHashFunction {
  * we can guarantee shuffle and bucketing have same data distribution
  */
 @ExpressionDescription(
-  usage = "_FUNC_(expr1, expr2, ...) - Returns a hash value of the arguments.")
+  usage = "_FUNC_(expr1, expr2, ...) - Returns a hash value of the arguments.",
+  since = "2.2.0",
+  group = "hash_funcs")
 case class HiveHash(children: Seq[Expression]) extends HashExpression[Int] {
   override val seed = 0
 
@@ -815,6 +865,9 @@ case class HiveHash(children: Seq[Expression]) extends HashExpression[Int] {
        |$code
      """.stripMargin
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): HiveHash =
+    copy(children = newChildren)
 }
 
 object HiveHashFunction extends InterpretedHashFunction {
@@ -887,7 +940,7 @@ object HiveHashFunction extends InterpretedHashFunction {
    * - year, month (stored as HiveIntervalYearMonth)
    * - day, hour, minute, second, nanosecond (stored as HiveIntervalDayTime)
    *
-   * eg. (INTERVAL '30' YEAR + INTERVAL '-23' DAY) fails in Hive
+   * e.g. (INTERVAL '30' YEAR + INTERVAL '-23' DAY) fails in Hive
    *
    * This method mimics HiveIntervalDayTime.hashCode() in Hive.
    *
@@ -899,15 +952,14 @@ object HiveHashFunction extends InterpretedHashFunction {
    *
    * - Spark's [[CalendarInterval]] has precision upto microseconds but Hive's
    *   HiveIntervalDayTime can store data with precision upto nanoseconds. So, any input intervals
-   *   with nanosecond values will lead to wrong output hashes (ie. non adherent with Hive output)
+   *   with nanosecond values will lead to wrong output hashes (i.e. non adherent with Hive output)
    */
   def hashCalendarInterval(calendarInterval: CalendarInterval): Long = {
-    val totalSeconds = calendarInterval.microseconds / CalendarInterval.MICROS_PER_SECOND.toInt
+    val totalMicroSeconds = calendarInterval.days * MICROS_PER_DAY + calendarInterval.microseconds
+    val totalSeconds = totalMicroSeconds / MICROS_PER_SECOND.toInt
     val result: Int = (17 * 37) + (totalSeconds ^ totalSeconds >> 32).toInt
 
-    val nanoSeconds =
-      (calendarInterval.microseconds -
-        (totalSeconds * CalendarInterval.MICROS_PER_SECOND.toInt)).toInt * 1000
+    val nanoSeconds = (totalMicroSeconds - (totalSeconds * MICROS_PER_SECOND.toInt)).toInt * 1000
      (result * 37) + nanoSeconds
   }
 

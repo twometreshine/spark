@@ -17,7 +17,6 @@
 
 package org.apache.spark.ui
 
-import java.util.Locale
 import javax.servlet.http.HttpServletRequest
 
 import scala.xml.Node
@@ -25,8 +24,9 @@ import scala.xml.Node
 import org.mockito.Mockito.{mock, when, RETURNS_SMART_NULLS}
 
 import org.apache.spark._
-import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.internal.config.Status._
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.scheduler._
 import org.apache.spark.status.AppStatusStore
 import org.apache.spark.status.api.v1.{AccumulableInfo => UIAccumulableInfo, StageData, StageStatus}
@@ -91,12 +91,15 @@ class StagePageSuite extends SparkFunSuite with LocalSparkContext {
         accumulatorUpdates = Seq(new UIAccumulableInfo(0L, "acc", None, "value")),
         tasks = None,
         executorSummary = None,
-        killedTasksSummary = Map.empty
+        killedTasksSummary = Map.empty,
+        ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+        peakExecutorMetrics = None,
+        taskMetricsDistributions = None,
+        executorMetricsDistributions = None
       )
       val taskTable = new TaskPagedTable(
         stageData,
         basePath = "/a/b/c",
-        currentTime = 0,
         pageSize = 10,
         sortColumn = "Index",
         desc = false,
@@ -131,7 +134,8 @@ class StagePageSuite extends SparkFunSuite with LocalSparkContext {
       val page = new StagePage(tab, statusStore)
 
       // Simulate a stage in job progress listener
-      val stageInfo = new StageInfo(0, 0, "dummy", 1, Seq.empty, Seq.empty, "details")
+      val stageInfo = new StageInfo(0, 0, "dummy", 1, Seq.empty, Seq.empty, "details",
+        resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
       // Simulate two tasks to test PEAK_EXECUTION_MEMORY correctness
       (1 to 2).foreach {
         taskId =>
@@ -141,8 +145,10 @@ class StagePageSuite extends SparkFunSuite with LocalSparkContext {
           listener.onTaskStart(SparkListenerTaskStart(0, 0, taskInfo))
           taskInfo.markFinished(TaskState.FINISHED, System.currentTimeMillis())
           val taskMetrics = TaskMetrics.empty
+          val executorMetrics = new ExecutorMetrics
           taskMetrics.incPeakExecutionMemory(peakExecutionMemory)
-          listener.onTaskEnd(SparkListenerTaskEnd(0, 0, "result", Success, taskInfo, taskMetrics))
+          listener.onTaskEnd(SparkListenerTaskEnd(0, 0, "result", Success, taskInfo,
+            executorMetrics, taskMetrics))
       }
       listener.onStageCompleted(SparkListenerStageCompleted(stageInfo))
       page.render(request)

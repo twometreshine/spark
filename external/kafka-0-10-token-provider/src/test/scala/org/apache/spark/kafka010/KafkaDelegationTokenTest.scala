@@ -37,8 +37,12 @@ trait KafkaDelegationTokenTest extends BeforeAndAfterEach {
 
   private def doReturn(value: Any) = org.mockito.Mockito.doReturn(value, Seq.empty: _*)
 
-  protected val tokenId = "tokenId" + ju.UUID.randomUUID().toString
-  protected val tokenPassword = "tokenPassword" + ju.UUID.randomUUID().toString
+  private var savedSparkEnv: SparkEnv = _
+
+  protected val tokenId1 = "tokenId" + ju.UUID.randomUUID().toString
+  protected val tokenPassword1 = "tokenPassword" + ju.UUID.randomUUID().toString
+  protected val tokenId2 = "tokenId" + ju.UUID.randomUUID().toString
+  protected val tokenPassword2 = "tokenPassword" + ju.UUID.randomUUID().toString
 
   protected val identifier1 = "cluster1"
   protected val identifier2 = "cluster2"
@@ -47,8 +51,10 @@ trait KafkaDelegationTokenTest extends BeforeAndAfterEach {
   protected val bootStrapServers = "127.0.0.1:0"
   protected val matchingTargetServersRegex = "127.0.0.*:0"
   protected val nonMatchingTargetServersRegex = "127.0.intentionally_non_matching.*:0"
+  protected val trustStoreType = "customTrustStoreType"
   protected val trustStoreLocation = "/path/to/trustStore"
   protected val trustStorePassword = "trustStoreSecret"
+  protected val keyStoreType = "customKeyStoreType"
   protected val keyStoreLocation = "/path/to/keyStore"
   protected val keyStorePassword = "keyStoreSecret"
   protected val keyPassword = "keySecret"
@@ -72,11 +78,16 @@ trait KafkaDelegationTokenTest extends BeforeAndAfterEach {
     }
   }
 
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    savedSparkEnv = SparkEnv.get
+  }
+
   override def afterEach(): Unit = {
     try {
       Configuration.setConfiguration(null)
-      UserGroupInformation.setLoginUser(null)
-      SparkEnv.set(null)
+      UserGroupInformation.reset()
+      SparkEnv.set(savedSparkEnv)
     } finally {
       super.afterEach()
     }
@@ -86,7 +97,7 @@ trait KafkaDelegationTokenTest extends BeforeAndAfterEach {
     Configuration.setConfiguration(new KafkaJaasConfiguration)
   }
 
-  protected def addTokenToUGI(tokenService: Text): Unit = {
+  protected def addTokenToUGI(tokenService: Text, tokenId: String, tokenPassword: String): Unit = {
     val token = new Token[KafkaDelegationTokenIdentifier](
       tokenId.getBytes,
       tokenPassword.getBytes,
@@ -115,8 +126,10 @@ trait KafkaDelegationTokenTest extends BeforeAndAfterEach {
       KafkaTokenSparkConf.DEFAULT_TARGET_SERVERS_REGEX,
       securityProtocol,
       KafkaTokenSparkConf.DEFAULT_SASL_KERBEROS_SERVICE_NAME,
+      Some(trustStoreType),
       Some(trustStoreLocation),
       Some(trustStorePassword),
+      Some(keyStoreType),
       Some(keyStoreLocation),
       Some(keyStorePassword),
       Some(keyPassword),

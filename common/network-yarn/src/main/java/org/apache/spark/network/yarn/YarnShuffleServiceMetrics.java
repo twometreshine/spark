@@ -26,15 +26,17 @@ import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.apache.hadoop.metrics2.MetricsSource;
 
 /**
- * Forward {@link org.apache.spark.network.shuffle.ExternalShuffleBlockHandler.ShuffleMetrics}
+ * Forward {@link org.apache.spark.network.shuffle.ExternalBlockHandler.ShuffleMetrics}
  * to hadoop metrics system.
  * NodeManager by default exposes JMX endpoint where can be collected.
  */
 class YarnShuffleServiceMetrics implements MetricsSource {
 
+  private final String metricsNamespace;
   private final MetricSet metricSet;
 
-  YarnShuffleServiceMetrics(MetricSet metricSet) {
+  YarnShuffleServiceMetrics(String metricsNamespace, MetricSet metricSet) {
+    this.metricsNamespace = metricsNamespace;
     this.metricSet = metricSet;
   }
 
@@ -46,7 +48,7 @@ class YarnShuffleServiceMetrics implements MetricsSource {
    */
   @Override
   public void getMetrics(MetricsCollector collector, boolean all) {
-    MetricsRecordBuilder metricsRecordBuilder = collector.addRecord("sparkShuffleService");
+    MetricsRecordBuilder metricsRecordBuilder = collector.addRecord(metricsNamespace);
 
     for (Map.Entry<String, Metric> entry : metricSet.getMetrics().entrySet()) {
       collectMetric(metricsRecordBuilder, entry.getKey(), entry.getValue());
@@ -55,7 +57,7 @@ class YarnShuffleServiceMetrics implements MetricsSource {
 
   /**
    * The metric types used in
-   * {@link org.apache.spark.network.shuffle.ExternalShuffleBlockHandler.ShuffleMetrics}.
+   * {@link org.apache.spark.network.shuffle.ExternalBlockHandler.ShuffleMetrics}.
    * Visible for testing.
    */
   public static void collectMetric(

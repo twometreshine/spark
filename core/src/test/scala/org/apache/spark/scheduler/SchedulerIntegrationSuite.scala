@@ -26,6 +26,7 @@ import scala.concurrent.duration.{Duration, SECONDS}
 import scala.reflect.ClassTag
 
 import org.scalactic.TripleEquals
+import org.scalatest.Assertions
 import org.scalatest.Assertions.AssertionsHelper
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.time.SpanSugar._
@@ -35,6 +36,7 @@ import org.apache.spark.TaskState._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.SCHEDULER_REVIVE_INTERVAL
 import org.apache.spark.rdd.RDD
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.util.{CallSite, ThreadUtils, Utils}
 
 /**
@@ -42,7 +44,7 @@ import org.apache.spark.util.{CallSite, ThreadUtils, Utils}
  * TaskSetManagers.
  *
  * Test cases are configured by providing a set of jobs to submit, and then simulating interaction
- * with spark's executors via a mocked backend (eg., task completion, task failure, executors
+ * with spark's executors via a mocked backend (e.g., task completion, task failure, executors
  * disconnecting, etc.).
  */
 abstract class SchedulerIntegrationSuite[T <: MockBackend: ClassTag] extends SparkFunSuite
@@ -311,7 +313,7 @@ private[spark] abstract class MockBackend(
   def taskSuccess(task: TaskDescription, result: Any): Unit = {
     val ser = env.serializer.newInstance()
     val resultBytes = ser.serialize(result)
-    val directResult = new DirectTaskResult(resultBytes, Seq()) // no accumulator updates
+    val directResult = new DirectTaskResult(resultBytes, Seq(), Array()) // no accumulator updates
     taskUpdate(task, TaskState.FINISHED, directResult)
   }
 
@@ -370,7 +372,7 @@ private[spark] abstract class MockBackend(
 
   /**
    * Accessed by both scheduling and backend thread, so should be protected by this.
-   * Most likely the only thing that needs to be protected are the inidividual ExecutorTaskStatus,
+   * Most likely the only thing that needs to be protected are the individual ExecutorTaskStatus,
    * but for simplicity in this mock just lock the whole backend.
    */
   def executorIdToExecutor: Map[String, ExecutorTaskStatus]
@@ -384,7 +386,7 @@ private[spark] abstract class MockBackend(
     }.toIndexedSeq
   }
 
-  override def maxNumConcurrentTasks(): Int = 0
+  override def maxNumConcurrentTasks(rp: ResourceProfile): Int = 0
 
   /**
    * This is called by the scheduler whenever it has tasks it would like to schedule, when a tasks
@@ -405,9 +407,9 @@ private[spark] abstract class MockBackend(
         (taskDescription, task)
       }
       newTasks.foreach { case (taskDescription, _) =>
+        freeCores -= taskScheduler.CPUS_PER_TASK
         executorIdToExecutor(taskDescription.executorId).freeCores -= taskScheduler.CPUS_PER_TASK
       }
-      freeCores -= newTasks.size * taskScheduler.CPUS_PER_TASK
       assignedTasksWaitingToRun ++= newTasks
     }
   }
@@ -463,7 +465,7 @@ class MockRDD(
   override def toString: String = "MockRDD " + id
 }
 
-object MockRDD extends AssertionsHelper with TripleEquals {
+object MockRDD extends AssertionsHelper with TripleEquals with Assertions {
   /**
    * make sure all the shuffle dependencies have a consistent number of output partitions
    * (mostly to make sure the test setup makes sense, not that Spark itself would get this wrong)
@@ -533,8 +535,8 @@ class BasicSchedulerIntegrationSuite extends SchedulerIntegrationSuite[SingleCor
    */
   testScheduler("super simple job") {
     def runBackend(): Unit = {
-      val (taskDescripition, _) = backend.beginTask()
-      backend.taskSuccess(taskDescripition, 42)
+      val (taskDescription, _) = backend.beginTask()
+      backend.taskSuccess(taskDescription, 42)
     }
     withBackend(runBackend _) {
       val jobFuture = submit(new MockRDD(sc, 10, Nil), (0 until 10).toArray)
@@ -621,7 +623,7 @@ class BasicSchedulerIntegrationSuite extends SchedulerIntegrationSuite[SingleCor
           backend.taskSuccess(taskDescription, DAGSchedulerSuite.makeMapStatus("hostA", 10))
         case (1, 0, 0) =>
           val fetchFailed = FetchFailed(
-            DAGSchedulerSuite.makeBlockManagerId("hostA"), shuffleId, 0, 0, "ignored")
+            DAGSchedulerSuite.makeBlockManagerId("hostA"), shuffleId, 0L, 0, 0, "ignored")
           backend.taskFailed(taskDescription, fetchFailed)
         case (1, _, partition) =>
           backend.taskSuccess(taskDescription, 42 + partition)

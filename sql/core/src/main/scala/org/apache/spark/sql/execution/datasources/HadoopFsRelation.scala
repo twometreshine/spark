@@ -17,12 +17,9 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import org.apache.hadoop.fs.Path
-
 import org.apache.spark.sql.{SparkSession, SQLContext}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.execution.FileRelation
-import org.apache.spark.sql.execution.command.CommandUtils
 import org.apache.spark.sql.sources.{BaseRelation, DataSourceRegister}
 import org.apache.spark.sql.types.{StructField, StructType}
 
@@ -43,6 +40,8 @@ import org.apache.spark.sql.types.{StructField, StructType}
 case class HadoopFsRelation(
     location: FileIndex,
     partitionSchema: StructType,
+    // The top-level columns in `dataSchema` should match the actual physical file schema, otherwise
+    // the ORC data source may not work with the by-ordinal mode.
     dataSchema: StructType,
     bucketSpec: Option[BucketSpec],
     fileFormat: FileFormat,
@@ -70,13 +69,7 @@ case class HadoopFsRelation(
 
   override def sizeInBytes: Long = {
     val compressionFactor = sqlContext.conf.fileCompressionFactor
-    val defaultSize = (location.sizeInBytes * compressionFactor).toLong
-    location match {
-      case cfi: CatalogFileIndex if sparkSession.sessionState.conf.fallBackToHdfsForStatsEnabled =>
-        CommandUtils.getSizeInBytesFallBackToHdfs(sparkSession, new Path(cfi.table.location),
-          defaultSize)
-      case _ => defaultSize
-    }
+    (location.sizeInBytes * compressionFactor).toLong
   }
 
 

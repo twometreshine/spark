@@ -19,11 +19,11 @@ package org.apache.spark.sql.execution.datasources
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.plans.CodegenInterpretedPlanTest
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
 class FileFormatWriterSuite
   extends QueryTest
-  with SharedSQLContext
+  with SharedSparkSession
   with CodegenInterpretedPlanTest{
 
   import testImplicits._
@@ -59,6 +59,19 @@ class FileFormatWriterSuite
       sql("create table t2(id long, p string) using parquet partitioned by (p)")
       sql("insert overwrite table t2 partition(p) select id, p from t1")
       checkAnswer(spark.table("t2").sort("id"), Seq(Row(0, null), Row(1, null), Row(2, null)))
+    }
+  }
+
+  test("SPARK-33904: save and insert into a table in a namespace of spark_catalog") {
+    val ns = "spark_catalog.ns"
+    withNamespace(ns) {
+      spark.sql(s"CREATE NAMESPACE $ns")
+      val t = s"$ns.tbl"
+      withTable(t) {
+        spark.range(1).write.saveAsTable(t)
+        Seq(100).toDF().write.insertInto(t)
+        checkAnswer(spark.table(t), Seq(Row(0), Row(100)))
+      }
     }
   }
 }

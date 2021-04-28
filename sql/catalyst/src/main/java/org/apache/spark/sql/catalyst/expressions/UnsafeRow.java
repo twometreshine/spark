@@ -90,11 +90,17 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
           FloatType,
           DoubleType,
           DateType,
-          TimestampType
+          TimestampType,
+          YearMonthIntervalType,
+          DayTimeIntervalType
         })));
   }
 
   public static boolean isFixedLength(DataType dt) {
+    if (dt instanceof UserDefinedType) {
+      return isFixedLength(((UserDefinedType) dt).sqlType());
+    }
+
     if (dt instanceof DecimalType) {
       return ((DecimalType) dt).precision() <= Decimal.MAX_LONG_DIGITS();
     } else {
@@ -103,7 +109,12 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
   }
 
   public static boolean isMutable(DataType dt) {
-    return mutableFieldTypes.contains(dt) || dt instanceof DecimalType;
+    if (dt instanceof UserDefinedType) {
+      return isMutable(((UserDefinedType) dt).sqlType());
+    }
+
+    return mutableFieldTypes.contains(dt) || dt instanceof DecimalType ||
+      dt instanceof CalendarIntervalType;
   }
 
   //////////////////////////////////////////////////////////////////////////////
@@ -279,7 +290,7 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
       Platform.putLong(baseObject, baseOffset + cursor, 0L);
       Platform.putLong(baseObject, baseOffset + cursor + 8, 0L);
 
-      if (value == null) {
+      if (value == null || !value.changePrecision(precision, value.scale())) {
         setNullAt(ordinal);
         // keep the offset for future update
         Platform.putLong(baseObject, getFieldOffset(ordinal), cursor << 32);
@@ -294,6 +305,26 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
           bytes, Platform.BYTE_ARRAY_OFFSET, baseObject, baseOffset + cursor, bytes.length);
         setLong(ordinal, (cursor << 32) | ((long) bytes.length));
       }
+    }
+  }
+
+  @Override
+  public void setInterval(int ordinal, CalendarInterval value) {
+    assertIndexIsValid(ordinal);
+    long cursor = getLong(ordinal) >>> 32;
+    assert cursor > 0 : "invalid cursor " + cursor;
+    if (value == null) {
+      setNullAt(ordinal);
+      // zero-out the bytes
+      Platform.putLong(baseObject, baseOffset + cursor, 0L);
+      Platform.putLong(baseObject, baseOffset + cursor + 8, 0L);
+      // keep the offset for future update
+      Platform.putLong(baseObject, getFieldOffset(ordinal), (cursor << 32) | 16L);
+    } else {
+      Platform.putInt(baseObject, baseOffset + cursor, value.months);
+      Platform.putInt(baseObject, baseOffset + cursor + 4, value.days);
+      Platform.putLong(baseObject, baseOffset + cursor + 8, value.microseconds);
+      setLong(ordinal, (cursor << 32) | 16L);
     }
   }
 
@@ -401,9 +432,10 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
     } else {
       final long offsetAndSize = getLong(ordinal);
       final int offset = (int) (offsetAndSize >> 32);
-      final int months = (int) Platform.getLong(baseObject, baseOffset + offset);
+      final int months = Platform.getInt(baseObject, baseOffset + offset);
+      final int days = Platform.getInt(baseObject, baseOffset + offset + 4);
       final long microseconds = Platform.getLong(baseObject, baseOffset + offset + 8);
-      return new CalendarInterval(months, microseconds);
+      return new CalendarInterval(months, days, microseconds);
     }
   }
 

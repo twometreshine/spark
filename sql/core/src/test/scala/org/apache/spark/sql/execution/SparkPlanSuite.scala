@@ -19,11 +19,12 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.QueryTest
+import org.apache.spark.sql.catalyst.plans.logical.Deduplicate
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
-class SparkPlanSuite extends QueryTest with SharedSQLContext {
+class SparkPlanSuite extends QueryTest with SharedSparkSession {
 
   test("SPARK-21619 execution of a canonicalized plan should fail") {
     val plan = spark.range(10).queryExecution.executedPlan.canonicalized
@@ -34,10 +35,11 @@ class SparkPlanSuite extends QueryTest with SharedSQLContext {
     intercept[IllegalStateException] { plan.executeToIterator() }
     intercept[IllegalStateException] { plan.executeBroadcast() }
     intercept[IllegalStateException] { plan.executeTake(1) }
+    intercept[IllegalStateException] { plan.executeTail(1) }
   }
 
   test("SPARK-23731 plans should be canonicalizable after being (de)serialized") {
-    withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> "parquet") {
+    withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
       withTempPath { path =>
         spark.range(1).write.parquet(path.getAbsolutePath)
         val df = spark.read.parquet(path.getAbsolutePath)
@@ -56,7 +58,7 @@ class SparkPlanSuite extends QueryTest with SharedSQLContext {
   }
 
   test("SPARK-27418 BatchScanExec should be canonicalizable after being (de)serialized") {
-    withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> "") {
+    withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "") {
       withTempPath { path =>
         spark.range(1).write.parquet(path.getAbsolutePath)
         val df = spark.read.parquet(path.getAbsolutePath)
@@ -75,12 +77,36 @@ class SparkPlanSuite extends QueryTest with SharedSQLContext {
   }
 
   test("SPARK-25357 SparkPlanInfo of FileScan contains nonEmpty metadata") {
-    withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> "parquet") {
+    withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
       withTempPath { path =>
         spark.range(5).write.parquet(path.getAbsolutePath)
         val f = spark.read.parquet(path.getAbsolutePath)
         assert(SparkPlanInfo.fromSparkPlan(f.queryExecution.sparkPlan).metadata.nonEmpty)
       }
     }
+  }
+
+  test("SPARK-30780 empty LocalTableScan should use RDD without partitions") {
+    assert(LocalTableScanExec(Nil, Nil).execute().getNumPartitions == 0)
+  }
+
+  test("SPARK-33617: change default parallelism of LocalTableScan") {
+    Seq(1, 4).foreach { minPartitionNum =>
+      withSQLConf(SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> minPartitionNum.toString) {
+        val df = spark.sql("SELECT * FROM VALUES (1), (2), (3), (4), (5), (6), (7), (8)")
+        assert(df.rdd.partitions.length === minPartitionNum)
+      }
+    }
+  }
+
+  test("SPARK-34420: Throw exception if non-streaming Deduplicate is not replaced by aggregate") {
+    val df = spark.range(10)
+    val planner = spark.sessionState.planner
+    val deduplicate = Deduplicate(df.queryExecution.analyzed.output, df.queryExecution.analyzed)
+    val err = intercept[IllegalStateException] {
+      planner.plan(deduplicate)
+    }
+    assert(err.getMessage.contains("Deduplicate operator for non streaming data source " +
+      "should have been replaced by aggregate in the optimizer"))
   }
 }

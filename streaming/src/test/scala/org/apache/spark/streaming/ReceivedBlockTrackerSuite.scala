@@ -28,8 +28,10 @@ import scala.util.Random
 import org.apache.hadoop.conf.Configuration
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{doThrow, reset, spy}
-import org.scalatest.{BeforeAndAfter, Matchers}
+import org.scalatest.BeforeAndAfter
 import org.scalatest.concurrent.Eventually._
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.internal.Logging
@@ -184,7 +186,7 @@ class ReceivedBlockTrackerSuite
     // Set the time increment level to twice the rotation interval so that every increment creates
     // a new log file
 
-    def incrementTime() {
+    def incrementTime(): Unit = {
       val timeIncrementMillis = 2000L
       manualClock.advance(timeIncrementMillis)
     }
@@ -197,7 +199,7 @@ class ReceivedBlockTrackerSuite
     }
 
     // Print the data present in the log ahead files in the log directory
-    def printLogFiles(message: String) {
+    def printLogFiles(message: String): Unit = {
       val fileContents = getWriteAheadLogFiles().map { file =>
         (s"\n>>>>> $file: <<<<<\n${getWrittenLogData(file).mkString("\n")}")
       }.mkString("\n")

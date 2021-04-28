@@ -23,6 +23,7 @@ import java.util.Properties
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.config.APP_CALLER_CONTEXT
+import org.apache.spark.internal.plugin.PluginContainer
 import org.apache.spark.memory.{MemoryMode, TaskMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.rdd.InputFileBlockHolder
@@ -82,7 +83,8 @@ private[spark] abstract class Task[T](
       taskAttemptId: Long,
       attemptNumber: Int,
       metricsSystem: MetricsSystem,
-      resources: Map[String, ResourceInformation]): T = {
+      resources: Map[String, ResourceInformation],
+      plugins: Option[PluginContainer]): T = {
     SparkEnv.get.blockManager.registerTask(taskAttemptId)
     // TODO SPARK-24874 Allow create BarrierTaskContext based on partitions, instead of whether
     // the stage is barrier.
@@ -122,6 +124,8 @@ private[spark] abstract class Task[T](
       Option(stageAttemptId),
       Option(taskAttemptId),
       Option(attemptNumber)).setCurrentContext()
+
+    plugins.foreach(_.onTaskStart())
 
     try {
       runTask(context)
@@ -225,7 +229,7 @@ private[spark] abstract class Task[T](
    * be called multiple times.
    * If interruptThread is true, we will also call Thread.interrupt() on the Task's executor thread.
    */
-  def kill(interruptThread: Boolean, reason: String) {
+  def kill(interruptThread: Boolean, reason: String): Unit = {
     require(reason != null)
     _reasonIfKilled = reason
     if (context != null) {

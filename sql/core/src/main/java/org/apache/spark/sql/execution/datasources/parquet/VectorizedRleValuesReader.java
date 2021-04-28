@@ -17,6 +17,10 @@
 
 package org.apache.spark.sql.execution.datasources.parquet;
 
+import java.io.IOException;
+import java.math.BigInteger;
+import java.nio.ByteBuffer;
+
 import org.apache.parquet.Preconditions;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.bytes.BytesUtils;
@@ -27,9 +31,6 @@ import org.apache.parquet.io.ParquetDecodingException;
 import org.apache.parquet.io.api.Binary;
 
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
-
-import java.io.IOException;
-import java.nio.ByteBuffer;
 
 /**
  * A values reader for Parquet's run-length encoded data. This is based off of the version in
@@ -46,7 +47,7 @@ public final class VectorizedRleValuesReader extends ValuesReader
   // Current decoding mode. The encoded data contains groups of either run length encoded data
   // (RLE) or bit packed data. Each group contains a header that indicates which group it is and
   // the number of values in the group.
-  // More details here: https://github.com/Parquet/parquet-format/blob/master/Encodings.md
+  // More details here: https://github.com/apache/parquet-format/blob/master/Encodings.md
   private enum MODE {
     RLE,
     PACKED
@@ -203,6 +204,79 @@ public final class VectorizedRleValuesReader extends ValuesReader
     }
   }
 
+  // A fork of `readIntegers`, reading the signed integers as unsigned in long type
+  public void readUnsignedIntegers(
+      int total,
+      WritableColumnVector c,
+      int rowId,
+      int level,
+      VectorizedValuesReader data) throws IOException {
+    int left = total;
+    while (left > 0) {
+      if (this.currentCount == 0) this.readNextGroup();
+      int n = Math.min(left, this.currentCount);
+      switch (mode) {
+        case RLE:
+          if (currentValue == level) {
+            data.readUnsignedIntegers(n, c, rowId);
+          } else {
+            c.putNulls(rowId, n);
+          }
+          break;
+        case PACKED:
+          for (int i = 0; i < n; ++i) {
+            if (currentBuffer[currentBufferIdx++] == level) {
+              c.putLong(rowId + i, Integer.toUnsignedLong(data.readInteger()));
+            } else {
+              c.putNull(rowId + i);
+            }
+          }
+          break;
+      }
+      rowId += n;
+      left -= n;
+      currentCount -= n;
+    }
+  }
+
+  // A fork of `readIntegers`, which rebases the date int value (days) before filling
+  // the Spark column vector.
+  public void readIntegersWithRebase(
+      int total,
+      WritableColumnVector c,
+      int rowId,
+      int level,
+      VectorizedValuesReader data,
+      final boolean failIfRebase) throws IOException {
+    int left = total;
+    while (left > 0) {
+      if (this.currentCount == 0) this.readNextGroup();
+      int n = Math.min(left, this.currentCount);
+      switch (mode) {
+        case RLE:
+          if (currentValue == level) {
+            data.readIntegersWithRebase(n, c, rowId, failIfRebase);
+          } else {
+            c.putNulls(rowId, n);
+          }
+          break;
+        case PACKED:
+          for (int i = 0; i < n; ++i) {
+            if (currentBuffer[currentBufferIdx++] == level) {
+              int julianDays = data.readInteger();
+              c.putInt(rowId + i, VectorizedColumnReader.rebaseDays(julianDays, failIfRebase));
+            } else {
+              c.putNull(rowId + i);
+            }
+          }
+          break;
+      }
+      rowId += n;
+      left -= n;
+      currentCount -= n;
+    }
+  }
+
   // TODO: can this code duplication be removed without a perf penalty?
   public void readBooleans(
       int total,
@@ -285,9 +359,7 @@ public final class VectorizedRleValuesReader extends ValuesReader
       switch (mode) {
         case RLE:
           if (currentValue == level) {
-            for (int i = 0; i < n; i++) {
-              c.putShort(rowId + i, (short)data.readInteger());
-            }
+            data.readShorts(n, c, rowId);
           } else {
             c.putNulls(rowId, n);
           }
@@ -295,7 +367,7 @@ public final class VectorizedRleValuesReader extends ValuesReader
         case PACKED:
           for (int i = 0; i < n; ++i) {
             if (currentBuffer[currentBufferIdx++] == level) {
-              c.putShort(rowId + i, (short)data.readInteger());
+              c.putShort(rowId + i, data.readShort());
             } else {
               c.putNull(rowId + i);
             }
@@ -313,6 +385,58 @@ public final class VectorizedRleValuesReader extends ValuesReader
       WritableColumnVector c,
       int rowId,
       int level,
+      VectorizedValuesReader data,
+      boolean downCastLongToInt) throws IOException {
+    int left = total;
+    while (left > 0) {
+      if (this.currentCount == 0) this.readNextGroup();
+      int n = Math.min(left, this.currentCount);
+      switch (mode) {
+        case RLE:
+          if (currentValue == level) {
+            if (downCastLongToInt) {
+              for (int i = 0; i < n; ++i) {
+                c.putInt(rowId + i, (int) data.readLong());
+              }
+            } else {
+              data.readLongs(n, c, rowId);
+            }
+          } else {
+            c.putNulls(rowId, n);
+          }
+          break;
+        case PACKED:
+          // code repeated for performance
+          if (downCastLongToInt) {
+            for (int i = 0; i < n; ++i) {
+              if (currentBuffer[currentBufferIdx++] == level) {
+                c.putInt(rowId + i, (int) data.readLong());
+              } else {
+                c.putNull(rowId + i);
+              }
+            }
+          } else {
+            for (int i = 0; i < n; ++i) {
+              if (currentBuffer[currentBufferIdx++] == level) {
+                c.putLong(rowId + i, data.readLong());
+              } else {
+                c.putNull(rowId + i);
+              }
+            }
+          }
+          break;
+      }
+      rowId += n;
+      left -= n;
+      currentCount -= n;
+    }
+  }
+
+  public void readUnsignedLongs(
+      int total,
+      WritableColumnVector c,
+      int rowId,
+      int level,
       VectorizedValuesReader data) throws IOException {
     int left = total;
     while (left > 0) {
@@ -321,7 +445,7 @@ public final class VectorizedRleValuesReader extends ValuesReader
       switch (mode) {
         case RLE:
           if (currentValue == level) {
-            data.readLongs(n, c, rowId);
+            data.readUnsignedLongs(n, c, rowId);
           } else {
             c.putNulls(rowId, n);
           }
@@ -329,7 +453,46 @@ public final class VectorizedRleValuesReader extends ValuesReader
         case PACKED:
           for (int i = 0; i < n; ++i) {
             if (currentBuffer[currentBufferIdx++] == level) {
-              c.putLong(rowId + i, data.readLong());
+              byte[] bytes = new BigInteger(Long.toUnsignedString(data.readLong())).toByteArray();
+              c.putByteArray(rowId + i, bytes);
+            } else {
+              c.putNull(rowId + i);
+            }
+          }
+          break;
+      }
+      rowId += n;
+      left -= n;
+      currentCount -= n;
+    }
+  }
+
+  // A fork of `readLongs`, which rebases the timestamp long value (microseconds) before filling
+  // the Spark column vector.
+  public void readLongsWithRebase(
+      int total,
+      WritableColumnVector c,
+      int rowId,
+      int level,
+      VectorizedValuesReader data,
+      final boolean failIfRebase) throws IOException {
+    int left = total;
+    while (left > 0) {
+      if (this.currentCount == 0) this.readNextGroup();
+      int n = Math.min(left, this.currentCount);
+      switch (mode) {
+        case RLE:
+          if (currentValue == level) {
+            data.readLongsWithRebase(n, c, rowId, failIfRebase);
+          } else {
+            c.putNulls(rowId, n);
+          }
+          break;
+        case PACKED:
+          for (int i = 0; i < n; ++i) {
+            if (currentBuffer[currentBufferIdx++] == level) {
+              long julianMicros = data.readLong();
+              c.putLong(rowId + i, VectorizedColumnReader.rebaseMicros(julianMicros, failIfRebase));
             } else {
               c.putNull(rowId + i);
             }
@@ -509,7 +672,28 @@ public final class VectorizedRleValuesReader extends ValuesReader
   }
 
   @Override
+  public void readUnsignedIntegers(int total, WritableColumnVector c, int rowId) {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
+  public void readUnsignedLongs(int total, WritableColumnVector c, int rowId) {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
+  public void readIntegersWithRebase(
+      int total, WritableColumnVector c, int rowId, boolean failIfRebase) {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
   public byte readByte() {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
+  public short readShort() {
     throw new UnsupportedOperationException("only readInts is valid.");
   }
 
@@ -519,7 +703,18 @@ public final class VectorizedRleValuesReader extends ValuesReader
   }
 
   @Override
+  public void readShorts(int total, WritableColumnVector c, int rowId) {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
   public void readLongs(int total, WritableColumnVector c, int rowId) {
+    throw new UnsupportedOperationException("only readInts is valid.");
+  }
+
+  @Override
+  public void readLongsWithRebase(
+      int total, WritableColumnVector c, int rowId, boolean failIfRebase) {
     throw new UnsupportedOperationException("only readInts is valid.");
   }
 
